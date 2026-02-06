@@ -39,6 +39,11 @@ import java.util.TimerTask
 
 
 class VAForegroundService : Service() {
+    companion object {
+        /** Set to true to enable debug toasts and signaling overlay on dashboard. */
+        const val DEBUG_OVERLAY = false
+    }
+
     private lateinit var config: APPConfig
     private var wifiLock: WifiManager.WifiLock? = null
     private var keyguardLock: KeyguardManager.KeyguardLock? = null
@@ -250,7 +255,7 @@ class VAForegroundService : Service() {
         if (signalingClient != null) return
         if (config.accessToken.isBlank()) {
             Timber.d("Signaling client not started: missing access token")
-            showDebugToast("Signaling: missing access token — retrying")
+            if (DEBUG_OVERLAY) showDebugToast("Signaling: missing access token — retrying")
             return
         }
 
@@ -259,9 +264,7 @@ class VAForegroundService : Service() {
         val wsUrl = base.removePrefix("http://").removePrefix("https://")
         if (wsUrl.isBlank() || wsUrl.startsWith(":") || wsUrl.matches(Regex("^\\d+$"))) {
             Timber.d("Signaling client not started: no valid HA host available (base='$base')")
-            showDebugToast("Signaling waiting for HA host: $base")
-            // schedule a retry in 5 seconds, avoid multiple jobs
-            // schedule a retry in 5 seconds using Handler (avoid requiring coroutines here)
+            if (DEBUG_OVERLAY) showDebugToast("Signaling waiting for HA host: $base")
             if (signalingRetryHandler == null && signalingRetryRunnable == null) {
                 signalingRetryHandler = Handler(Looper.getMainLooper())
                 signalingRetryRunnable = Runnable {
@@ -281,15 +284,21 @@ class VAForegroundService : Service() {
                     val caller = data.getString("caller_uuid")
                     val sdp = data.getString("sdp")
 
-                    // Log the offer event for overlay
-                    try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "offer from $caller to $target")) } catch (e: Exception) {}
+                    if (DEBUG_OVERLAY) {
+                        try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "offer from $caller to $target")) } catch (e: Exception) {}
+                    }
 
                     if (target != config.uuid) return
-
                     if (isVideoCallActivityActive()) return
 
-                    showDebugToast("Incoming call offer from $caller")
-                    CallNotifications.showIncomingCall(caller, sdp, this@VAForegroundService)
+                    if (DEBUG_OVERLAY) showDebugToast("Incoming call offer from $caller")
+
+                    // Show in-app overlay instead of notification
+                    val payload = JSONObject().apply {
+                        put("caller_uuid", caller)
+                        put("sdp", sdp)
+                    }
+                    config.eventBroadcaster.notifyEvent(Event("incomingCall", "", payload.toString()))
                 } catch (e: Exception) {
                     Logger().e("Foreground signaling offer error: $e")
                 }
@@ -299,7 +308,9 @@ class VAForegroundService : Service() {
                 try {
                     val caller = data.getString("caller_uuid")
                     val target = data.getString("target_device")
-                    try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "answer from $caller to $target")) } catch (e: Exception) {}
+                    if (DEBUG_OVERLAY) {
+                        try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "answer from $caller to $target")) } catch (e: Exception) {}
+                    }
                 } catch (e: Exception) {}
             }
 
@@ -307,7 +318,9 @@ class VAForegroundService : Service() {
                 try {
                     val caller = data.getString("caller_uuid")
                     val target = data.getString("target_device")
-                    try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "ice from $caller to $target")) } catch (e: Exception) {}
+                    if (DEBUG_OVERLAY) {
+                        try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "ice from $caller to $target")) } catch (e: Exception) {}
+                    }
                 } catch (e: Exception) {}
             }
 
@@ -316,9 +329,10 @@ class VAForegroundService : Service() {
                     val caller = data.getString("caller_uuid")
                     val target = data.getString("target_device")
 
-                    // Log the start_call event regardless of who it is for
-                    try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "start_call from $caller to $target")) } catch (e: Exception) {}
-                    showDebugToast("start_call from $caller to $target")
+                    if (DEBUG_OVERLAY) {
+                        try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "start_call from $caller to $target")) } catch (e: Exception) {}
+                        showDebugToast("start_call from $caller to $target")
+                    }
 
                     if (caller == config.uuid && target.isNotBlank()) {
                         val intent = Intent(this@VAForegroundService, VideoCallActivity::class.java).apply {
@@ -331,18 +345,53 @@ class VAForegroundService : Service() {
                     Logger().e("Foreground signaling start-call error: $e")
                 }
             }
+
+            override fun onCallEndedReceived(data: JSONObject) {
+                try {
+                    val caller = data.optString("caller_uuid", "")
+                    val target = data.optString("target_device", "")
+                    if (DEBUG_OVERLAY) {
+                        try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "call_ended from $caller to $target")) } catch (e: Exception) {}
+                    }
+                    // If this device is either the caller or target, end the call
+                    if (target == config.uuid || caller == config.uuid) {
+                        config.eventBroadcaster.notifyEvent(Event("callEnded", "", ""))
+                    }
+                } catch (e: Exception) {
+                    Logger().e("Foreground signaling call-ended error: $e")
+                }
+            }
+
+            override fun onCallDeclinedReceived(data: JSONObject) {
+                try {
+                    val caller = data.optString("caller_uuid", "")
+                    val target = data.optString("target_device", "")
+                    if (DEBUG_OVERLAY) {
+                        try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "call_declined by $target for $caller")) } catch (e: Exception) {}
+                    }
+                    // If this device is the caller, end the call (callee declined)
+                    if (caller == config.uuid) {
+                        config.eventBroadcaster.notifyEvent(Event("callEnded", "", ""))
+                    }
+                } catch (e: Exception) {
+                    Logger().e("Foreground signaling call-declined error: $e")
+                }
+            }
         })
 
         signalingClient?.statusCallback = { connected ->
             Timber.d("Signaling status changed: $connected")
-            showDebugToast("Signaling: ${if (connected) "Connected" else "Disconnected"}")
+            if (DEBUG_OVERLAY) showDebugToast("Signaling: ${if (connected) "Connected" else "Disconnected"}")
             config.eventBroadcaster.notifyEvent(Event("signalingConnected", "", connected))
+            if (!connected) {
+                // Auto-reconnect after a delay
+                scheduleSignalingReconnect()
+            }
         }
 
-        // wire up log callback so logs appear in UI overlay
         signalingClient?.logCallback = { msg ->
             try {
-                config.eventBroadcaster.notifyEvent(Event("signalingLog", "", msg))
+                if (DEBUG_OVERLAY) config.eventBroadcaster.notifyEvent(Event("signalingLog", "", msg))
                 Timber.d("SIGLOG: $msg")
             } catch (e: Exception) {}
         }
@@ -361,6 +410,27 @@ class VAForegroundService : Service() {
         signalingClient?.close()
         signalingClient = null
         Timber.d("Foreground signaling client stopped")
+    }
+
+    /**
+     * Schedule a reconnect attempt after a delay.
+     * Cleans up the current client first so startSignalingClient() can create a new one.
+     */
+    private fun scheduleSignalingReconnect(delayMs: Long = 10_000) {
+        // Avoid duplicate scheduled reconnects
+        if (signalingRetryHandler != null && signalingRetryRunnable != null) return
+
+        Timber.d("Scheduling signaling reconnect in ${delayMs}ms")
+        signalingClient?.close()
+        signalingClient = null
+
+        signalingRetryHandler = Handler(Looper.getMainLooper())
+        signalingRetryRunnable = Runnable {
+            signalingRetryHandler = null
+            signalingRetryRunnable = null
+            startSignalingClient()
+        }
+        signalingRetryHandler?.postDelayed(signalingRetryRunnable!!, delayMs)
     }
 
     private fun isVideoCallActivityActive(): Boolean {

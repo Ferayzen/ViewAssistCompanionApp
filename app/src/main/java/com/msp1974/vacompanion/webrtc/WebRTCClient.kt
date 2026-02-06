@@ -21,7 +21,16 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
     private var remoteVideoTrack: VideoTrack? = null
     private var videoCapturer: VideoCapturer? = null
     private var surfaceTextureHelper: SurfaceTextureHelper? = null
+    private var videoSource: VideoSource? = null
     private var remoteRenderer: SurfaceViewRenderer? = null
+
+    // Guards to prevent double-init
+    private var localCapturing = false
+    private var localRendererAttached = false
+    private var remoteRendererInitialized = false
+
+    /** Expose the shared EGL context so renderers can be pre-initialised. */
+    fun getEglContext(): EglBase.Context = eglBase.eglBaseContext
 
     fun init() {
         val initializationOptions = PeerConnectionFactory.InitializationOptions.builder(ctx)
@@ -39,6 +48,12 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
             .createPeerConnectionFactory()
     }
 
+    /**
+     * Creates the PeerConnection **and** adds both audio AND video tracks
+     * so the SDP always includes video regardless of whether a renderer
+     * is attached yet.  Camera capture is NOT started here — call
+     * [startLocalVideo] once a SurfaceViewRenderer is available.
+     */
     fun createPeerConnection() {
         val iceServers = listOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()
@@ -47,8 +62,12 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
         rtcConfig.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
 
         peerConnection = peerConnectionFactory?.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
-            override fun onSignalingChange(newState: PeerConnection.SignalingState) {}
-            override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState) {}
+            override fun onSignalingChange(newState: PeerConnection.SignalingState) {
+                log.d("PC signalingState -> $newState")
+            }
+            override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState) {
+                log.d("PC iceConnectionState -> $newState")
+            }
             override fun onIceConnectionReceivingChange(p0: Boolean) {}
             override fun onIceGatheringChange(p0: PeerConnection.IceGatheringState) {}
             override fun onIceCandidate(candidate: IceCandidate) {
@@ -64,6 +83,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
                 try {
                     val track = receiver?.track()
                     if (track is VideoTrack) {
+                        log.d("onAddTrack: remote video track received")
                         remoteVideoTrack = track
                         remoteRenderer?.let { track.addSink(it) }
                         listener.onRemoteStreamAvailable()
@@ -78,6 +98,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
                     val receiver = transceiver?.receiver
                     val track = receiver?.track()
                     if (track is VideoTrack) {
+                        log.d("onTrack: remote video track received")
                         remoteVideoTrack = track
                         remoteRenderer?.let { track.addSink(it) }
                         listener.onRemoteStreamAvailable()
@@ -88,20 +109,33 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
             }
         })
 
-        // Create audio source
+        // ---- Audio ----
         val audioConstraints = MediaConstraints()
         val audioSource = peerConnectionFactory?.createAudioSource(audioConstraints)
         localAudioTrack = peerConnectionFactory?.createAudioTrack("ARDAMSa0", audioSource)
+        peerConnection?.addTrack(localAudioTrack)
 
-        // Add audio track to PeerConnection
-        val audioSender = peerConnection?.addTrack(localAudioTrack)
+        // ---- Video (source + track) ----
+        // Create the capturer, source, and track NOW so they are part of the
+        // PeerConnection before any offer/answer is generated.  The actual
+        // camera capture is deferred until startLocalVideo().
+        try {
+            videoCapturer = createCameraCapturer()
+            surfaceTextureHelper = SurfaceTextureHelper.create("WebRTC-CaptureThread", eglBase.eglBaseContext)
+            videoSource = peerConnectionFactory?.createVideoSource(videoCapturer!!.isScreencast)
+            videoCapturer?.initialize(surfaceTextureHelper, ctx, videoSource?.capturerObserver)
+
+            localVideoTrack = peerConnectionFactory?.createVideoTrack("ARDAMSv0", videoSource)
+            localVideoTrack?.setEnabled(true)
+            peerConnection?.addTrack(localVideoTrack)
+            log.d("Video track created and added to PeerConnection")
+        } catch (e: Exception) {
+            log.e("Error creating video track: $e")
+        }
     }
 
-    fun startLocalVideo(localRenderer: SurfaceViewRenderer) {
-        if (peerConnectionFactory == null) init()
-        if (peerConnection == null) createPeerConnection()
-
-        // Create video capturer (Camera2 if possible)
+    /** Enumerate cameras and prefer front-facing. */
+    private fun createCameraCapturer(): VideoCapturer? {
         val enumerator = Camera2Enumerator(ctx)
         val deviceNames = enumerator.deviceNames
         var chosenDevice: String? = null
@@ -112,36 +146,76 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
             }
         }
         if (chosenDevice == null && deviceNames.isNotEmpty()) chosenDevice = deviceNames[0]
-        videoCapturer = enumerator.createCapturer(chosenDevice, null)
+        log.d("Camera device chosen: $chosenDevice")
+        return if (chosenDevice != null) enumerator.createCapturer(chosenDevice, null) else null
+    }
 
-        surfaceTextureHelper = SurfaceTextureHelper.create(Thread.currentThread().name, eglBase.eglBaseContext)
-        val videoSource = peerConnectionFactory?.createVideoSource(videoCapturer!!.isScreencast)
-        videoCapturer?.initialize(surfaceTextureHelper, ctx, videoSource?.capturerObserver)
-        videoCapturer?.startCapture(640, 480, 30)
+    /**
+     * Initialise the local renderer and start the camera.
+     * Safe to call multiple times — capture and renderer init are guarded.
+     */
+    fun startLocalVideo(localRenderer: SurfaceViewRenderer) {
+        // Initialise the renderer only once
+        if (!localRendererAttached) {
+            try {
+                localRenderer.init(eglBase.eglBaseContext, null)
+                localRenderer.setMirror(true)
+                localRendererAttached = true
+                log.d("Local renderer initialised")
+            } catch (e: Exception) {
+                log.e("Error initialising local renderer (may already be initialised): $e")
+                localRendererAttached = true  // assume already initialised
+            }
+        }
 
-        localVideoTrack = peerConnectionFactory?.createVideoTrack("ARDAMSv0", videoSource)
-        // setup renderer
-        localRenderer.init(eglBase.eglBaseContext, null)
-        localRenderer.setMirror(true)
+        // Attach the renderer as a sink
         localVideoTrack?.addSink(localRenderer)
 
-        // add local track to peer connection
-        peerConnection?.addTrack(localVideoTrack)
+        // Start camera capture if not already started
+        if (!localCapturing) {
+            try {
+                videoCapturer?.startCapture(640, 480, 30)
+                localCapturing = true
+                log.d("Camera capture started (640x480@30)")
+            } catch (e: Exception) {
+                log.e("Error starting camera capture: $e")
+            }
+        }
     }
 
     fun stopLocalVideo() {
         try {
-            videoCapturer?.stopCapture()
-        } catch (e: Exception) {}
-        videoCapturer?.dispose()
-        surfaceTextureHelper?.dispose()
-        localVideoTrack = null
+            if (localCapturing) {
+                videoCapturer?.stopCapture()
+                localCapturing = false
+            }
+        } catch (e: Exception) {
+            log.e("Error stopping capture: $e")
+        }
+        try { videoCapturer?.dispose() } catch (_: Exception) {}
+        try { surfaceTextureHelper?.dispose() } catch (_: Exception) {}
     }
 
+    /**
+     * Attach a renderer for the remote video stream.
+     * Safe to call multiple times.
+     */
     fun setRemoteRenderer(renderer: SurfaceViewRenderer) {
         remoteRenderer = renderer
-        remoteRenderer?.init(eglBase.eglBaseContext, null)
-        remoteVideoTrack?.let { it.addSink(remoteRenderer) }
+        if (!remoteRendererInitialized) {
+            try {
+                remoteRenderer?.init(eglBase.eglBaseContext, null)
+                remoteRendererInitialized = true
+                log.d("Remote renderer initialised")
+            } catch (e: Exception) {
+                log.e("Error initialising remote renderer (may already be initialised): $e")
+                remoteRendererInitialized = true
+            }
+        }
+        remoteVideoTrack?.let {
+            it.addSink(remoteRenderer)
+            log.d("Remote video track attached to renderer")
+        }
     }
 
     fun createOffer() {
@@ -151,11 +225,13 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
 
         peerConnection?.createOffer(object : SdpObserver {
             override fun onCreateSuccess(sessionDescription: SessionDescription) {
+                log.d("Offer SDP created, setting local description")
                 peerConnection?.setLocalDescription(object : SdpObserver {
                     override fun onSetSuccess() {
+                        log.d("Local description set (offer)")
                         listener.onLocalSdp(sessionDescription.type.canonicalForm(), sessionDescription.description)
                     }
-                    override fun onSetFailure(p0: String?) {}
+                    override fun onSetFailure(p0: String?) { log.e("setLocalDesc failed: $p0") }
                     override fun onCreateSuccess(p0: SessionDescription?) {}
                     override fun onCreateFailure(p0: String?) {}
                 }, sessionDescription)
@@ -163,7 +239,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
 
             override fun onSetSuccess() {}
             override fun onSetFailure(p0: String?) {}
-            override fun onCreateFailure(p0: String?) {}
+            override fun onCreateFailure(p0: String?) { log.e("createOffer failed: $p0") }
         }, constraints)
     }
 
@@ -174,11 +250,13 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
 
         peerConnection?.createAnswer(object : SdpObserver {
             override fun onCreateSuccess(sessionDescription: SessionDescription) {
+                log.d("Answer SDP created, setting local description")
                 peerConnection?.setLocalDescription(object : SdpObserver {
                     override fun onSetSuccess() {
+                        log.d("Local description set (answer)")
                         listener.onLocalSdp(sessionDescription.type.canonicalForm(), sessionDescription.description)
                     }
-                    override fun onSetFailure(p0: String?) {}
+                    override fun onSetFailure(p0: String?) { log.e("setLocalDesc(answer) failed: $p0") }
                     override fun onCreateSuccess(p0: SessionDescription?) {}
                     override fun onCreateFailure(p0: String?) {}
                 }, sessionDescription)
@@ -186,15 +264,16 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
 
             override fun onSetSuccess() {}
             override fun onSetFailure(p0: String?) {}
-            override fun onCreateFailure(p0: String?) {}
+            override fun onCreateFailure(p0: String?) { log.e("createAnswer failed: $p0") }
         }, constraints)
     }
 
     fun setRemoteDescription(type: String, sdp: String) {
+        log.d("Setting remote description ($type)")
         val sd = SessionDescription(SessionDescription.Type.fromCanonicalForm(type), sdp)
         peerConnection?.setRemoteDescription(object : SdpObserver {
-            override fun onSetSuccess() {}
-            override fun onSetFailure(p0: String?) {}
+            override fun onSetSuccess() { log.d("Remote description set successfully ($type)") }
+            override fun onSetFailure(p0: String?) { log.e("setRemoteDescription($type) failed: $p0") }
             override fun onCreateSuccess(p0: SessionDescription?) {}
             override fun onCreateFailure(p0: String?) {}
         }, sd)
@@ -208,7 +287,9 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
         try {
             stopLocalVideo()
             peerConnection?.close()
+            peerConnection = null
             peerConnectionFactory?.dispose()
+            peerConnectionFactory = null
             eglBase.release()
         } catch (e: Exception) {
             log.e("Error disposing WebRTCClient: $e")

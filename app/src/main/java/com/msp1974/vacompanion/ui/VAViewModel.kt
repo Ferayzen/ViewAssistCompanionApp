@@ -40,7 +40,11 @@ data class State(
     var webViewPageLoadingStage: PageLoadingStage = PageLoadingStage.NOT_STARTED,
     var showUUIDChangeDialog: Boolean = false,
     var signalingConnected: Boolean = false,
-    var signalingLog: List<String> = listOf()
+    var signalingLog: List<String> = listOf(),
+
+    // Incoming call overlay state (shown on dashboard)
+    var incomingCallCaller: String? = null,
+    var incomingCallSdp: String? = null
     )
 
 class VAViewModel: ViewModel(), EventListener {
@@ -149,6 +153,35 @@ class VAViewModel: ViewModel(), EventListener {
                     )
                 }
             }
+            "incomingCall" -> {
+                try {
+                    val json = org.json.JSONObject(event.newValue as String)
+                    _vacaState.update { currentState ->
+                        currentState.copy(
+                            incomingCallCaller = json.getString("caller_uuid"),
+                            incomingCallSdp = json.getString("sdp")
+                        )
+                    }
+                } catch (e: Exception) {
+                    log.e("Error parsing incomingCall event: $e")
+                }
+            }
+            "incomingCallDismiss" -> {
+                _vacaState.update { currentState ->
+                    currentState.copy(
+                        incomingCallCaller = null,
+                        incomingCallSdp = null
+                    )
+                }
+            }
+            "callEnded" -> {
+                _vacaState.update { currentState ->
+                    currentState.copy(
+                        incomingCallCaller = null,
+                        incomingCallSdp = null
+                    )
+                }
+            }
             else -> consumed = false
         }
         if (consumed) {
@@ -232,8 +265,7 @@ class VAViewModel: ViewModel(), EventListener {
                     "IP Address" to (if (Helpers.isNetworkAvailable(config!!.context)) Helpers.getIpv4HostAddress() else ""),
                     "Port" to APPConfig.SERVER_PORT.toString(),
                     "UUID" to config!!.uuid,
-                    "Paired to" to config!!.pairedDeviceID,
-                    "Signaling" to (if (_vacaState.value.signalingConnected) "Connected" else "Disconnected")
+                    "Paired to" to config!!.pairedDeviceID
                 )
            )
        }

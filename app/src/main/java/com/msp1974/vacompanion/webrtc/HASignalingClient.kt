@@ -18,6 +18,10 @@ interface HASignalingListener {
     fun onIceReceived(data: JSONObject)
     // Optional: called when a start call event is received (no SDP) - useful to ring UI
     fun onStartCallReceived(data: JSONObject) { }
+    // Optional: called when the remote side ends the call
+    fun onCallEndedReceived(data: JSONObject) { }
+    // Optional: called when the remote side declines the call
+    fun onCallDeclinedReceived(data: JSONObject) { }
 }
 
 class HASignalingClient(private val config: APPConfig, private val listener: HASignalingListener) {
@@ -71,6 +75,8 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
                                 subscribeEvent(webSocket, "vaca_webrtc_answer")
                                 subscribeEvent(webSocket, "vaca_webrtc_ice")
                                 subscribeEvent(webSocket, "vaca_start_call")
+                                subscribeEvent(webSocket, "vaca_call_ended")
+                                subscribeEvent(webSocket, "vaca_call_declined")
                                 try { logCallback?.invoke("Subscribed to vaca_* events") } catch (e: Exception) {}
                                 // Notify that we are connected and authenticated
                                 try { statusCallback?.invoke(true) } catch (e: Exception) {}
@@ -97,6 +103,12 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
                                     "vaca_start_call" -> {
                                         // Passive start call notification - forwarded to listener if implemented
                                         try { listener.onStartCallReceived(data) } catch (e: Exception) {}
+                                    }
+                                    "vaca_call_ended" -> {
+                                        try { listener.onCallEndedReceived(data) } catch (e: Exception) {}
+                                    }
+                                    "vaca_call_declined" -> {
+                                        try { listener.onCallDeclinedReceived(data) } catch (e: Exception) {}
                                     }
                                     else -> {
                                         try { logCallback?.invoke("Unhandled event type: $eventType") } catch (e: Exception) {}
@@ -171,5 +183,13 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
             put("candidate", candidate)
         }
         AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_webrtc_ice", json.toString(), config.accessToken, !config.ignoreSSLErrors)
+    }
+
+    fun sendCallEnded(callerUuid: String, targetDevice: String) {
+        val json = JSONObject().apply {
+            put("caller_uuid", callerUuid)
+            put("target_device", targetDevice)
+        }
+        AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_call_ended", json.toString(), config.accessToken, !config.ignoreSSLErrors)
     }
 }

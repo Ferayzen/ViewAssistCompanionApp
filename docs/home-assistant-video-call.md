@@ -56,11 +56,17 @@ Replace `script.start_vaca_video_call` with the script entity ID created in step
 4) The callee receives the offer and shows an incoming call notification.
 5) Accept launches the Video Call screen and answers the call.
 
+## Call End / Decline Flow
+
+- When either side presses End Call, a `vaca_call_ended` event is fired — both devices return to the dashboard.
+- When the callee declines, a `vaca_call_declined` event is fired — the caller device also returns to the dashboard.
+- Incoming calls auto-dismiss after 20 seconds if not accepted.
+
 ## Testing Guidelines
 
 1) Confirm both devices are paired and connected to Home Assistant.
 2) Ensure the foreground service is running on both devices (normal app start shows a persistent notification indicating the service is active).
-3) Verify the signaling client is connected by checking the Connect screen: the `Signaling` field should show `Connected` if the websocket is authenticated.
+3) Verify that signaling is working by checking app logs or the debug overlay (when enabled in code).
 4) From Developer Tools > Events in Home Assistant, paste the exact event payload:
 
 ```yaml
@@ -73,18 +79,18 @@ event_data:
 
 Replace the UUIDs using the values from each device's Connect screen.
 
-5) After firing the event: the caller device should open the call screen and the callee should receive an incoming call notification.
+5) After firing the event: the caller device should open the call screen and the callee should receive an incoming call overlay with Accept/Decline.
 6) Accept on the callee device and confirm audio/video connects.
 
 If nothing happens:
-- Check the Connect screen on both devices and ensure `Signaling` reads `Connected`.
-- If `Signaling` is `Disconnected`, confirm the app has a valid Home Assistant access token (Settings) and that HA is reachable from the device.
+- Check the Connect screen on both devices and ensure the app is connected to Home Assistant.
+- If not connected, confirm the app has a valid Home Assistant access token (Settings) and that HA is reachable from the device.
 - Inspect app logs (adb logcat) for WebSocket/auth errors.
 
 ## Troubleshooting
 
 - No reaction on caller: check that the app is running and has a valid Home Assistant access token.
-- No incoming notification: confirm the callee device UUID is correct and the device is online.
+- No incoming call overlay: confirm the callee device UUID is correct and the device is online.
 - No media: verify camera/microphone permissions and that both devices are on the same network or can reach each other.
 
 ## Notes
