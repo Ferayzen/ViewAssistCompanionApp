@@ -38,7 +38,9 @@ data class State(
     var permissions: PermissionsStatus = PermissionsStatus(),
     var updates: UpdateStatus = UpdateStatus(),
     var webViewPageLoadingStage: PageLoadingStage = PageLoadingStage.NOT_STARTED,
-    var showUUIDChangeDialog: Boolean = false
+    var showUUIDChangeDialog: Boolean = false,
+    var signalingConnected: Boolean = false,
+    var signalingLog: List<String> = listOf()
     )
 
 class VAViewModel: ViewModel(), EventListener {
@@ -130,6 +132,23 @@ class VAViewModel: ViewModel(), EventListener {
                     )
                 }
             }
+            "signalingConnected" -> {
+                _vacaState.update { currentState ->
+                    currentState.copy(
+                        signalingConnected = event.newValue as Boolean
+                    )
+                }
+            }
+            "signalingLog" -> {
+                // Append to existing list, keep last 50 entries
+                val msg = event.newValue as? String ?: ""
+                _vacaState.update { currentState ->
+                    val updated = (currentState.signalingLog + listOf(msg)).takeLast(50)
+                    currentState.copy(
+                        signalingLog = updated
+                    )
+                }
+            }
             else -> consumed = false
         }
         if (consumed) {
@@ -214,6 +233,7 @@ class VAViewModel: ViewModel(), EventListener {
                     "Port" to APPConfig.SERVER_PORT.toString(),
                     "UUID" to config!!.uuid,
                     "Paired to" to config!!.pairedDeviceID,
+                    "Signaling" to (if (_vacaState.value.signalingConnected) "Connected" else "Disconnected")
                 )
            )
        }

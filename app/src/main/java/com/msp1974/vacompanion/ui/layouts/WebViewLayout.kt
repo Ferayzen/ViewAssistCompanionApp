@@ -6,9 +6,11 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -22,6 +24,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -70,6 +73,40 @@ fun WebViewScreen (webView: WebView, vaViewModel: VAViewModel = viewModel()) {
                 vaUiState.diagnosticInfo,
                 modifier = Modifier.align(Alignment.TopCenter)
             )
+        }
+
+        // Signaling status overlay for debugging while the dashboard is shown
+        var showLog by remember { mutableStateOf(false) }
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(8.dp)
+                .background(Color.Black.copy(alpha = 0.6f))
+        ) {
+            Column(modifier = Modifier.padding(6.dp)) {
+                val statusText = if (vaUiState.signalingConnected) "Signaling: Connected" else "Signaling: Disconnected"
+                Text(
+                    text = statusText,
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    modifier = Modifier.clickable { showLog = !showLog }
+                )
+
+                // show a small preview of the last 3 log lines
+                if (!showLog) {
+                    val preview = vaUiState.signalingLog.takeLast(3)
+                    preview.forEach { line ->
+                        Text(text = line, color = Color.White, fontSize = 10.sp)
+                    }
+                } else {
+                    // full log view
+                    Column(modifier = Modifier) {
+                        vaUiState.signalingLog.forEach { line ->
+                            Text(text = line, color = Color.White, fontSize = 10.sp)
+                        }
+                    }
+                }
+            }
         }
     }
 }

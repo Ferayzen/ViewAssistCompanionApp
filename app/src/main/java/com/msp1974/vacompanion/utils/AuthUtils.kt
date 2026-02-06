@@ -10,6 +10,8 @@ import com.msp1974.vacompanion.jsinterface.ExternalAuthCallback
 import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
@@ -304,6 +306,75 @@ class AuthUtils(val config: APPConfig) {
             } catch (e: Exception) {
                 log.e("Error authorising with HA: ${e.message.toString()}")
                 return ""
+            }
+        }
+
+        // Perform a GET request to Home Assistant API using stored access token
+        fun haGet(url: String, config: APPConfig, verifySSL: Boolean = true): String {
+            val clientBuilder = OkHttpClient.Builder()
+
+            if (!verifySSL) {
+                val sslContext = SSLContext.getInstance("SSL")
+                sslContext.init(null, trustAllCerts, java.security.SecureRandom())
+                clientBuilder.sslSocketFactory(
+                    sslContext.socketFactory,
+                    trustAllCerts[0] as X509TrustManager
+                )
+                clientBuilder.hostnameVerifier { hostname, session -> true }
+            }
+
+            val client = clientBuilder.build()
+            val request = Request.Builder()
+                .url(url)
+                .addHeader("Authorization", "Bearer ${config.accessToken}")
+                .get()
+                .build()
+
+            try {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        log.e("Unexpected code $response")
+                        return ""
+                    }
+                    return response.body.string()
+                }
+            } catch (e: Exception) {
+                log.e("Error fetching HA data: ${e.message.toString()}")
+                return ""
+            }
+        }
+
+        // Post an event to Home Assistant (eg. /api/events/<event_type>)
+        fun haPostEvent(baseUrl: String, eventType: String, jsonBody: String, token: String, verifySSL: Boolean = true): Boolean {
+            val clientBuilder = OkHttpClient.Builder()
+
+            if (!verifySSL) {
+                val sslContext = SSLContext.getInstance("SSL")
+                sslContext.init(null, trustAllCerts, java.security.SecureRandom())
+                clientBuilder.sslSocketFactory(
+                    sslContext.socketFactory,
+                    trustAllCerts[0] as X509TrustManager
+                )
+                clientBuilder.hostnameVerifier { hostname, session -> true }
+            }
+
+            val client = clientBuilder.build()
+            val mediaType = "application/json; charset=utf-8".toMediaType()
+            val body = jsonBody.toRequestBody(mediaType)
+            val url = baseUrl.removeSuffix("/") + "/api/events/" + eventType
+            val request = Request.Builder()
+                .url(url)
+                .addHeader("Authorization", "Bearer " + token)
+                .post(body)
+                .build()
+
+            try {
+                client.newCall(request).execute().use { response ->
+                    return response.isSuccessful
+                }
+            } catch (e: Exception) {
+                log.e("Error posting HA event: ${e.message.toString()}")
+                return false
             }
         }
 

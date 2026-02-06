@@ -10,7 +10,10 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.widget.Toast
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -20,9 +23,16 @@ import com.google.firebase.crashlytics.crashlytics
 import com.msp1974.vacompanion.MainActivity
 import com.msp1974.vacompanion.R
 import com.msp1974.vacompanion.VACAApplication
+import com.msp1974.vacompanion.call.CallNotifications
 import com.msp1974.vacompanion.settings.APPConfig
 import com.msp1974.vacompanion.settings.BackgroundTaskStatus
+import com.msp1974.vacompanion.ui.VideoCallActivity
+import com.msp1974.vacompanion.utils.Event
+import com.msp1974.vacompanion.utils.EventListener
 import com.msp1974.vacompanion.utils.Logger
+import com.msp1974.vacompanion.webrtc.HASignalingClient
+import com.msp1974.vacompanion.webrtc.HASignalingListener
+import org.json.JSONObject
 import timber.log.Timber
 import java.util.Timer
 import java.util.TimerTask
@@ -35,6 +45,33 @@ class VAForegroundService : Service() {
     private var watchdogTimer: Timer = Timer()
 
     private var backgroundTask:  BackgroundTaskController? = null
+    private var signalingClient: HASignalingClient? = null
+    private var signalingRetryHandler: Handler? = null
+    private var signalingRetryRunnable: Runnable? = null
+
+    private val signalingEventListener = object : EventListener {
+        override fun onEventTriggered(event: Event) {
+            when (event.eventName) {
+                "pairedDeviceID" -> {
+                    val paired = event.newValue as? String ?: ""
+                    if (paired.isNotBlank()) {
+                        startSignalingClient()
+                    } else {
+                        stopSignalingClient()
+                    }
+                }
+                "accessToken" -> {
+                    val token = event.newValue as? String ?: ""
+                    if (token.isNotBlank()) {
+                        // Token set; ensure signaling client is started
+                        startSignalingClient()
+                    } else {
+                        stopSignalingClient()
+                    }
+                }
+            }
+        }
+    }
 
     enum class Actions {
         START, STOP
@@ -47,6 +84,7 @@ class VAForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         config = APPConfig.getInstance(this)
+        config.eventBroadcaster.addListener(signalingEventListener)
 
         // wifi lock
         val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
@@ -123,6 +161,7 @@ class VAForegroundService : Service() {
                 }
                 backgroundTask = BackgroundTaskController(this)
                 backgroundTask?.start()
+                startSignalingClient()
                 Timber.i("Background Service Started")
                 config.backgroundTaskRunning = true
                 config.backgroundTaskStatus = BackgroundTaskStatus.STARTED
@@ -188,6 +227,8 @@ class VAForegroundService : Service() {
     override fun onDestroy() {
         Timber.i("Stopping Background Service")
         watchdogTimer.cancel()
+        stopSignalingClient()
+        config.eventBroadcaster.removeListener(signalingEventListener)
         backgroundTask?.shutdown()
         config.backgroundTaskRunning = false
         config.backgroundTaskStatus = BackgroundTaskStatus.NOT_STARTED
@@ -202,6 +243,138 @@ class VAForegroundService : Service() {
             Timber.i("Enabling keyguard didn't work")
             ex.printStackTrace()
             Firebase.crashlytics.recordException(ex)
+        }
+    }
+
+    private fun startSignalingClient() {
+        if (signalingClient != null) return
+        if (config.accessToken.isBlank()) {
+            Timber.d("Signaling client not started: missing access token")
+            showDebugToast("Signaling: missing access token — retrying")
+            return
+        }
+
+        // Resolve base URL and ensure it contains a host (not just a port)
+        val base = com.msp1974.vacompanion.utils.AuthUtils.getHAUrl(config, withDashboardPath = false)
+        val wsUrl = base.removePrefix("http://").removePrefix("https://")
+        if (wsUrl.isBlank() || wsUrl.startsWith(":") || wsUrl.matches(Regex("^\\d+$"))) {
+            Timber.d("Signaling client not started: no valid HA host available (base='$base')")
+            showDebugToast("Signaling waiting for HA host: $base")
+            // schedule a retry in 5 seconds, avoid multiple jobs
+            // schedule a retry in 5 seconds using Handler (avoid requiring coroutines here)
+            if (signalingRetryHandler == null && signalingRetryRunnable == null) {
+                signalingRetryHandler = Handler(Looper.getMainLooper())
+                signalingRetryRunnable = Runnable {
+                    signalingRetryHandler = null
+                    signalingRetryRunnable = null
+                    startSignalingClient()
+                }
+                signalingRetryHandler?.postDelayed(signalingRetryRunnable!!, 5000)
+            }
+            return
+        }
+
+        signalingClient = HASignalingClient(config, object : HASignalingListener {
+            override fun onOfferReceived(data: JSONObject) {
+                try {
+                    val target = data.getString("target_device")
+                    val caller = data.getString("caller_uuid")
+                    val sdp = data.getString("sdp")
+
+                    // Log the offer event for overlay
+                    try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "offer from $caller to $target")) } catch (e: Exception) {}
+
+                    if (target != config.uuid) return
+
+                    if (isVideoCallActivityActive()) return
+
+                    showDebugToast("Incoming call offer from $caller")
+                    CallNotifications.showIncomingCall(caller, sdp, this@VAForegroundService)
+                } catch (e: Exception) {
+                    Logger().e("Foreground signaling offer error: $e")
+                }
+            }
+
+            override fun onAnswerReceived(data: JSONObject) {
+                try {
+                    val caller = data.getString("caller_uuid")
+                    val target = data.getString("target_device")
+                    try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "answer from $caller to $target")) } catch (e: Exception) {}
+                } catch (e: Exception) {}
+            }
+
+            override fun onIceReceived(data: JSONObject) {
+                try {
+                    val caller = data.getString("caller_uuid")
+                    val target = data.getString("target_device")
+                    try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "ice from $caller to $target")) } catch (e: Exception) {}
+                } catch (e: Exception) {}
+            }
+
+            override fun onStartCallReceived(data: JSONObject) {
+                try {
+                    val caller = data.getString("caller_uuid")
+                    val target = data.getString("target_device")
+
+                    // Log the start_call event regardless of who it is for
+                    try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "start_call from $caller to $target")) } catch (e: Exception) {}
+                    showDebugToast("start_call from $caller to $target")
+
+                    if (caller == config.uuid && target.isNotBlank()) {
+                        val intent = Intent(this@VAForegroundService, VideoCallActivity::class.java).apply {
+                            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                            putExtra("target_device", target)
+                        }
+                        startActivity(intent)
+                    }
+                } catch (e: Exception) {
+                    Logger().e("Foreground signaling start-call error: $e")
+                }
+            }
+        })
+
+        signalingClient?.statusCallback = { connected ->
+            Timber.d("Signaling status changed: $connected")
+            showDebugToast("Signaling: ${if (connected) "Connected" else "Disconnected"}")
+            config.eventBroadcaster.notifyEvent(Event("signalingConnected", "", connected))
+        }
+
+        // wire up log callback so logs appear in UI overlay
+        signalingClient?.logCallback = { msg ->
+            try {
+                config.eventBroadcaster.notifyEvent(Event("signalingLog", "", msg))
+                Timber.d("SIGLOG: $msg")
+            } catch (e: Exception) {}
+        }
+
+        signalingClient?.connect()
+        Timber.d("Foreground signaling client started")
+    }
+
+    private fun stopSignalingClient() {
+        // cancel any pending retry
+        if (signalingRetryHandler != null && signalingRetryRunnable != null) {
+            signalingRetryHandler?.removeCallbacks(signalingRetryRunnable!!)
+            signalingRetryHandler = null
+            signalingRetryRunnable = null
+        }
+        signalingClient?.close()
+        signalingClient = null
+        Timber.d("Foreground signaling client stopped")
+    }
+
+    private fun isVideoCallActivityActive(): Boolean {
+        val activity = VACAApplication.activityManager.activity
+        return activity is VideoCallActivity
+    }
+
+    private fun showDebugToast(message: String) {
+        Handler(Looper.getMainLooper()).post {
+            try {
+                Toast.makeText(this@VAForegroundService, message, Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Timber.d("Debug toast failed: ${e.message}")
+            }
         }
     }
 

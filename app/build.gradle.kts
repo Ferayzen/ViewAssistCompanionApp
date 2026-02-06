@@ -97,4 +97,7 @@ dependencies {
     implementation(libs.androidx.media3.ui)
     implementation(libs.androidx.media3.ui.compose)
 
+    // WebRTC (webrtc-sdk precompiled library on Maven Central) - POC for peer-to-peer audio/video
+    implementation("io.github.webrtc-sdk:android:137.7151.05")
+
 }

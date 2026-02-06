@@ -247,7 +247,13 @@ class APPConfig(val context: Context) {
 
     var accessToken: String
         get() = this.sharedPrefs.getString("auth_token", "") ?: ""
-        set(value) = this.sharedPrefs.edit { putString("auth_token", value) }
+        set(value) {
+            val old = this.sharedPrefs.getString("auth_token", "") ?: ""
+            this.sharedPrefs.edit { putString("auth_token", value) }
+            try {
+                if (old != value) eventBroadcaster.notifyEvent(com.msp1974.vacompanion.utils.Event("accessToken", old, value))
+            } catch (e: Exception) {}
+        }
 
     var refreshToken: String
         get() = this.sharedPrefs.getString("refresh_token", "") ?: ""

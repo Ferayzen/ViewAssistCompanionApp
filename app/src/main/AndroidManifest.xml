@@ -81,6 +81,36 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ui.VideoCallActivity"
+            android:exported="true"
+            android:label="Video Call">
+            <!-- Deep link so external integrations (eg. View Assist menu) can open the Video Call screen -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <!-- Example URL: vaca://connect/video?target=<device_id> -->
+                <data android:scheme="vaca" android:host="connect" android:pathPrefix="/video" />
+            </intent-filter>
+
+            <!-- Explicit action to start a call via Intent action + extra "target_device" -->
+            <intent-filter>
+                <action android:name="com.msp1974.vacompanion.START_VIDEO_CALL" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- Broadcast receiver for call actions -->
+        <receiver
+            android:name=".call.CallActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.msp1974.vacompanion.ACTION_ACCEPT_CALL" />
+                <action android:name="com.msp1974.vacompanion.ACTION_DECLINE_CALL" />
+            </intent-filter>
+        </receiver>
+
         <!--Service-->
         <service
             android:name=".service.VAForegroundService"
