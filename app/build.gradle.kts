@@ -98,6 +98,7 @@ dependencies {
     implementation(libs.androidx.media3.ui.compose)
 
     // WebRTC (webrtc-sdk precompiled library on Maven Central) - POC for peer-to-peer audio/video
-    implementation("io.github.webrtc-sdk:android:137.7151.05")
+    // Using M104 — M137 native lib crashes with SIGABRT on Android 8.x ARM32 devices
+    implementation("io.github.webrtc-sdk:android:104.5112.10")
 
 }

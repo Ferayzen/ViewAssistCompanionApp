@@ -12,7 +12,8 @@ interface WebRTCListener {
 
 class WebRTCClient(private val ctx: Context, private val listener: WebRTCListener) {
     private val log = Logger()
-    private var eglBase: EglBase = EglBase.create()
+    // EGL context — only created when video is enabled (API >= 28)
+    private var eglBase: EglBase? = null
     private var peerConnectionFactory: PeerConnectionFactory? = null
     private var peerConnection: PeerConnection? = null
 
@@ -30,7 +31,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
     private var remoteRendererInitialized = false
 
     /** Expose the shared EGL context so renderers can be pre-initialised. */
-    fun getEglContext(): EglBase.Context = eglBase.eglBaseContext
+    fun getEglContext(): EglBase.Context? = eglBase?.eglBaseContext
 
     fun init() {
         val initializationOptions = PeerConnectionFactory.InitializationOptions.builder(ctx)
@@ -38,8 +39,11 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
         PeerConnectionFactory.initialize(initializationOptions)
 
         val options = PeerConnectionFactory.Options()
-        val encoderFactory = DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true)
-        val decoderFactory = DefaultVideoDecoderFactory(eglBase.eglBaseContext)
+
+        eglBase = EglBase.create()
+        log.d("WebRTC init — EGL + HW codecs")
+        val encoderFactory = DefaultVideoEncoderFactory(eglBase!!.eglBaseContext, true, true)
+        val decoderFactory = DefaultVideoDecoderFactory(eglBase!!.eglBaseContext)
 
         peerConnectionFactory = PeerConnectionFactory.builder()
             .setOptions(options)
@@ -85,7 +89,14 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
                     if (track is VideoTrack) {
                         log.d("onAddTrack: remote video track received")
                         remoteVideoTrack = track
-                        remoteRenderer?.let { track.addSink(it) }
+                        // Ensure sink attachment happens on main thread to avoid renderer threading issues
+                        android.os.Handler(android.os.Looper.getMainLooper()).post {
+                            try {
+                                remoteRenderer?.let { track.addSink(it) }
+                            } catch (e: Exception) {
+                                log.e("Error attaching remote sink on main thread: $e")
+                            }
+                        }
                         listener.onRemoteStreamAvailable()
                     }
                 } catch (e: Exception) {
@@ -100,7 +111,13 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
                     if (track is VideoTrack) {
                         log.d("onTrack: remote video track received")
                         remoteVideoTrack = track
-                        remoteRenderer?.let { track.addSink(it) }
+                        android.os.Handler(android.os.Looper.getMainLooper()).post {
+                            try {
+                                remoteRenderer?.let { track.addSink(it) }
+                            } catch (e: Exception) {
+                                log.e("Error attaching remote sink on main thread: $e")
+                            }
+                        }
                         listener.onRemoteStreamAvailable()
                     }
                 } catch (e: Exception) {
@@ -115,13 +132,10 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
         localAudioTrack = peerConnectionFactory?.createAudioTrack("ARDAMSa0", audioSource)
         peerConnection?.addTrack(localAudioTrack)
 
-        // ---- Video (source + track) ----
-        // Create the capturer, source, and track NOW so they are part of the
-        // PeerConnection before any offer/answer is generated.  The actual
-        // camera capture is deferred until startLocalVideo().
+        // ---- Video ----
         try {
             videoCapturer = createCameraCapturer()
-            surfaceTextureHelper = SurfaceTextureHelper.create("WebRTC-CaptureThread", eglBase.eglBaseContext)
+            surfaceTextureHelper = SurfaceTextureHelper.create("WebRTC-CaptureThread", eglBase!!.eglBaseContext)
             videoSource = peerConnectionFactory?.createVideoSource(videoCapturer!!.isScreencast)
             videoCapturer?.initialize(surfaceTextureHelper, ctx, videoSource?.capturerObserver)
 
@@ -136,30 +150,65 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
 
     /** Enumerate cameras and prefer front-facing. */
     private fun createCameraCapturer(): VideoCapturer? {
-        val enumerator = Camera2Enumerator(ctx)
-        val deviceNames = enumerator.deviceNames
+        val useCamera2 = try {
+            Camera2Enumerator.isSupported(ctx)
+        } catch (e: Exception) {
+            log.e("Camera2.isSupported check failed: $e")
+            false
+        }
+
+        val enumerator: CameraEnumerator = if (useCamera2) {
+            try {
+                Camera2Enumerator(ctx)
+            } catch (e: Exception) {
+                log.e("Failed to create Camera2Enumerator: $e — falling back to Camera1Enumerator")
+                Camera1Enumerator(true)
+            }
+        } else {
+            Camera1Enumerator(true)
+        }
+
+        val deviceNames = try { enumerator.deviceNames } catch (e: Exception) {
+            log.e("Failed to enumerate camera devices: $e")
+            arrayOf<String>()
+        }
+
         var chosenDevice: String? = null
         for (name in deviceNames) {
-            if (enumerator.isFrontFacing(name)) {
-                chosenDevice = name
-                break
+            try {
+                if (enumerator.isFrontFacing(name)) {
+                    chosenDevice = name
+                    break
+                }
+            } catch (e: Exception) {
+                // ignore per-device errors
             }
         }
         if (chosenDevice == null && deviceNames.isNotEmpty()) chosenDevice = deviceNames[0]
-        log.d("Camera device chosen: $chosenDevice")
-        return if (chosenDevice != null) enumerator.createCapturer(chosenDevice, null) else null
+        log.d("Camera device chosen: $chosenDevice (using ${if (useCamera2) "Camera2" else "Camera1"})")
+        return if (chosenDevice != null) {
+            try {
+                enumerator.createCapturer(chosenDevice, null)
+            } catch (e: Exception) {
+                log.e("Failed to create capturer for $chosenDevice: $e")
+                null
+            }
+        } else null
     }
 
     /**
      * Initialise the local renderer and start the camera.
+     * No-op on audio-only devices.
      * Safe to call multiple times — capture and renderer init are guarded.
      */
     fun startLocalVideo(localRenderer: SurfaceViewRenderer) {
         // Initialise the renderer only once
         if (!localRendererAttached) {
             try {
-                localRenderer.init(eglBase.eglBaseContext, null)
+                localRenderer.init(eglBase!!.eglBaseContext, null)
                 localRenderer.setMirror(true)
+                try { localRenderer.setEnableHardwareScaler(false) } catch (_: Exception) {}
+                try { localRenderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT) } catch (_: Exception) {}
                 localRendererAttached = true
                 log.d("Local renderer initialised")
             } catch (e: Exception) {
@@ -168,17 +217,31 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
             }
         }
 
-        // Attach the renderer as a sink
-        localVideoTrack?.addSink(localRenderer)
+        // Attach the renderer as a sink (on main thread)
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            try {
+                localVideoTrack?.addSink(localRenderer)
+            } catch (e: Exception) {
+                log.e("Error attaching local sink on main thread: $e")
+            }
+        }
 
-        // Start camera capture if not already started
+        // Start camera capture if not already started. Try a couple of fallbacks for older devices.
         if (!localCapturing) {
             try {
                 videoCapturer?.startCapture(640, 480, 30)
                 localCapturing = true
                 log.d("Camera capture started (640x480@30)")
             } catch (e: Exception) {
-                log.e("Error starting camera capture: $e")
+                log.e("Error starting camera capture at 640x480: $e — trying 320x240@15")
+                try {
+                    videoCapturer?.startCapture(320, 240, 15)
+                    localCapturing = true
+                    log.d("Camera capture started (320x240@15)")
+                } catch (e2: Exception) {
+                    log.e("Error starting camera capture at 320x240: $e2")
+                    // Notify user-friendly message via Logger only (UI layer can react to logs)
+                }
             }
         }
     }
@@ -198,13 +261,17 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
 
     /**
      * Attach a renderer for the remote video stream.
+     * No-op on audio-only devices.
      * Safe to call multiple times.
      */
     fun setRemoteRenderer(renderer: SurfaceViewRenderer) {
         remoteRenderer = renderer
         if (!remoteRendererInitialized) {
             try {
-                remoteRenderer?.init(eglBase.eglBaseContext, null)
+                remoteRenderer?.init(eglBase!!.eglBaseContext, null)
+                try { remoteRenderer?.setEnableHardwareScaler(false) } catch (_: Exception) {}
+                try { remoteRenderer?.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT) } catch (_: Exception) {}
+                try { remoteRenderer?.setMirror(false) } catch (_: Exception) {}
                 remoteRendererInitialized = true
                 log.d("Remote renderer initialised")
             } catch (e: Exception) {
@@ -212,9 +279,16 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
                 remoteRendererInitialized = true
             }
         }
-        remoteVideoTrack?.let {
-            it.addSink(remoteRenderer)
-            log.d("Remote video track attached to renderer")
+        // Attach remote video on main thread to avoid renderer threading issues
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            try {
+                remoteVideoTrack?.let {
+                    it.addSink(remoteRenderer)
+                    log.d("Remote video track attached to renderer")
+                }
+            } catch (e: Exception) {
+                log.e("Error attaching remote video track on main thread: $e")
+            }
         }
     }
 
@@ -290,7 +364,8 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
             peerConnection = null
             peerConnectionFactory?.dispose()
             peerConnectionFactory = null
-            eglBase.release()
+            try { eglBase?.release() } catch (_: Exception) {}
+            eglBase = null
         } catch (e: Exception) {
             log.e("Error disposing WebRTCClient: $e")
         }

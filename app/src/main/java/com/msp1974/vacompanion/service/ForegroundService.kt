@@ -32,6 +32,8 @@ import com.msp1974.vacompanion.utils.EventListener
 import com.msp1974.vacompanion.utils.Logger
 import com.msp1974.vacompanion.webrtc.HASignalingClient
 import com.msp1974.vacompanion.webrtc.HASignalingListener
+import com.msp1974.vacompanion.webrtc.WebRTCClient
+import com.msp1974.vacompanion.utils.AuthUtils
 import org.json.JSONObject
 import timber.log.Timber
 import java.util.Timer
@@ -333,6 +335,7 @@ class VAForegroundService : Service() {
                         try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "start_call from $caller to $target")) } catch (e: Exception) {}
                         showDebugToast("start_call from $caller to $target")
                     }
+
 
                     if (caller == config.uuid && target.isNotBlank()) {
                         val intent = Intent(this@VAForegroundService, VideoCallActivity::class.java).apply {

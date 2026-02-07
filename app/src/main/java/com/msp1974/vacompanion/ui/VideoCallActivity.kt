@@ -300,7 +300,7 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
     }
 
     // -----------------------------------------------------------------------
-    //  UI — clean black layout, no device list
+    //  UI — adapts to video or audio-only mode
     // -----------------------------------------------------------------------
     Box(modifier = Modifier.fillMaxSize()) {
         // Remote video — full screen
@@ -311,7 +311,6 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
                     )
-                    setZOrderMediaOverlay(false)
                     remoteRendererRef = this
                 }
             },
