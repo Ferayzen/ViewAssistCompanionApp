@@ -1,9 +1,6 @@
 package com.msp1974.vacompanion.ui.layouts
 
-import android.content.BroadcastReceiver
-import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.media.RingtoneManager
 import android.view.ViewGroup
 import android.webkit.WebView
@@ -29,7 +26,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -49,7 +45,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
-import com.msp1974.vacompanion.broadcasts.BroadcastSender
 import com.msp1974.vacompanion.service.VAForegroundService
 import com.msp1974.vacompanion.settings.APPConfig
 import com.msp1974.vacompanion.settings.PageLoadingStage
@@ -61,7 +56,6 @@ import com.msp1974.vacompanion.utils.Event
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CoroutineScope
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import org.json.JSONObject
 
 /** Fire a vaca_call_declined event to Home Assistant. */
@@ -218,19 +212,10 @@ private fun IncomingCallOverlay(
 ) {
     val ctx = LocalContext.current
 
-    // Accept the call when the wake word is detected during a ringtone gap
-    DisposableEffect(Unit) {
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                onAccept()
-            }
-        }
-        LocalBroadcastManager.getInstance(ctx)
-            .registerReceiver(receiver, IntentFilter(BroadcastSender.WAKE_WORD_DETECTED))
-        onDispose {
-            LocalBroadcastManager.getInstance(ctx).unregisterReceiver(receiver)
-        }
-    }
+    // Wake word acceptance is handled by VAViewModel via the "acceptIncomingCall"
+    // event (fired by BackgroundTask).  No BroadcastReceiver needed here — this
+    // avoids a race where LocalBroadcastManager delivers WAKE_WORD_DETECTED to
+    // ClientHandler after the overlay has already cleared incomingCallActive.
 
     // Play ringtone in a pulsed pattern (ring ~2s, silence ~4s) so the wake word
     // detector can still hear the user during the silent gaps.

@@ -33,6 +33,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
@@ -352,17 +354,26 @@ internal class BackgroundTaskController (private val context: Context): EventLis
     }
 
     fun stopInputAudio() {
-        if (audioInJob != null && audioInJob!!.isActive) {
-            Timber.i("Stopping input audio")
-            audioInJob?.cancel()
-            // Wait for the AudioRecorder's finally block (stop + release) to complete
-            // so the native microphone handle is actually freed before we return.
-            scope.launch {
-                try { audioInJob?.join() } catch (_: Exception) {}
-                audioInJob = null
-                Timber.i("Audio input fully stopped and mic released")
-            }
+        val job = audioInJob ?: return
+        if (!job.isActive) {
+            audioInJob = null
+            return
         }
+        Timber.i("Stopping input audio")
+        job.cancel()
+        // Synchronously wait for the AudioRecorder's finally block (stop + release)
+        // so the native microphone handle is actually freed before we return.
+        // Without this, WebRTC's JavaAudioDeviceModule may fail to open its own
+        // AudioRecord on Android < 10 (no concurrent capture support).
+        try {
+            runBlocking {
+                withTimeout(3000) { job.join() }
+            }
+        } catch (_: Exception) {
+            Timber.w("Timed out waiting for audio input to stop")
+        }
+        audioInJob = null
+        Timber.i("Audio input fully stopped and mic released")
     }
 
     fun sendDiagnostics(audioLevel: Float, detectionLevel: Float) {
@@ -430,11 +441,13 @@ internal class BackgroundTaskController (private val context: Context): EventLis
                             )
                         )
                         if (config.incomingCallActive) {
-                            // Incoming call overlay is showing — only send the broadcast
-                            // so the overlay can accept the call.  Do NOT trigger the
-                            // assist pipeline, wake sound, or screen-on.
+                            // Incoming call overlay is showing — fire accept event.
+                            // Do NOT send WAKE_WORD_DETECTED broadcast because
+                            // LocalBroadcastManager delivers asynchronously and the
+                            // ClientHandler would see incomingCallActive=false (cleared
+                            // by the accept handler) and start the assist pipeline.
                             Timber.i("Wake word detected during incoming call — accepting call")
-                            BroadcastSender.sendBroadcast(context, BroadcastSender.WAKE_WORD_DETECTED)
+                            config.eventBroadcaster.notifyEvent(Event("acceptIncomingCall", "", ""))
                             return@collect
                         }
 

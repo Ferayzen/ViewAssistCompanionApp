@@ -1,5 +1,6 @@
 package com.msp1974.vacompanion.ui
 
+import android.content.Intent
 import android.content.res.Configuration
 import android.content.res.Resources
 import androidx.lifecycle.ViewModel
@@ -180,6 +181,29 @@ class VAViewModel: ViewModel(), EventListener {
                         incomingCallCaller = null,
                         incomingCallSdp = null
                     )
+                }
+            }
+            "acceptIncomingCall" -> {
+                // Wake word was detected while the incoming call overlay was showing.
+                // Accept the call by launching VideoCallActivity with auto-accept.
+                val state = _vacaState.value
+                val caller = state.incomingCallCaller
+                val sdp = state.incomingCallSdp
+                if (caller != null && sdp != null) {
+                    // Dismiss overlay first
+                    _vacaState.update { it.copy(incomingCallCaller = null, incomingCallSdp = null) }
+                    try {
+                        val ctx = config?.context ?: return
+                        val intent = Intent(ctx, VideoCallActivity::class.java).apply {
+                            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                            putExtra("incoming_caller", caller)
+                            putExtra("offer_sdp", sdp)
+                            putExtra("auto_accept", true)
+                        }
+                        ctx.startActivity(intent)
+                    } catch (e: Exception) {
+                        log.e("Error accepting call via wake word: $e")
+                    }
                 }
             }
             else -> consumed = false
