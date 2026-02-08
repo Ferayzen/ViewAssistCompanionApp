@@ -22,6 +22,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
     private var remoteVideoTrack: VideoTrack? = null
     private var videoCapturer: VideoCapturer? = null
     private var surfaceTextureHelper: SurfaceTextureHelper? = null
+    private var audioSource: AudioSource? = null
     private var videoSource: VideoSource? = null
     private var remoteRenderer: SurfaceViewRenderer? = null
 
@@ -29,6 +30,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
     private var localCapturing = false
     private var localRendererAttached = false
     private var remoteRendererInitialized = false
+    private var disposed = false
 
     /** Expose the shared EGL context so renderers can be pre-initialised. */
     fun getEglContext(): EglBase.Context? = eglBase?.eglBaseContext
@@ -128,7 +130,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
 
         // ---- Audio ----
         val audioConstraints = MediaConstraints()
-        val audioSource = peerConnectionFactory?.createAudioSource(audioConstraints)
+        audioSource = peerConnectionFactory?.createAudioSource(audioConstraints)
         localAudioTrack = peerConnectionFactory?.createAudioTrack("ARDAMSa0", audioSource)
         localAudioTrack?.setEnabled(true)
         peerConnection?.addTrack(localAudioTrack)
@@ -257,8 +259,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
         } catch (e: Exception) {
             log.e("Error stopping capture: $e")
         }
-        try { videoCapturer?.dispose() } catch (_: Exception) {}
-        try { surfaceTextureHelper?.dispose() } catch (_: Exception) {}
+        // Note: capturer and surfaceTextureHelper are disposed in dispose()
     }
 
     /**
@@ -359,15 +360,65 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
         peerConnection?.addIceCandidate(candidate)
     }
 
+    /**
+     * Release SurfaceViewRenderers. Must be called BEFORE [dispose] because
+     * renderers depend on the EGL context that dispose() releases.
+     */
+    fun releaseRenderers(localRenderer: SurfaceViewRenderer?, remoteRenderer: SurfaceViewRenderer?) {
+        log.d("Releasing renderers")
+        // Remove sinks first so tracks don't write to dead renderers
+        try { localVideoTrack?.removeSink(localRenderer) } catch (_: Exception) {}
+        try { remoteVideoTrack?.removeSink(remoteRenderer) } catch (_: Exception) {}
+        // Release renderer EGL surfaces
+        try { localRenderer?.release() } catch (_: Exception) {}
+        try { remoteRenderer?.release() } catch (_: Exception) {}
+    }
+
     fun dispose() {
+        if (disposed) return
+        disposed = true
+        log.d("Disposing WebRTCClient")
         try {
+            // 1. Stop camera capture (but don't dispose capturer yet)
             stopLocalVideo()
-            peerConnection?.close()
+
+            // 2. Close peer connection FIRST — detaches tracks from transceivers internally.
+            //    This must happen before disposing tracks/sources or native resources
+            //    may not be properly released on older devices.
+            try { peerConnection?.close() } catch (_: Exception) {}
             peerConnection = null
-            peerConnectionFactory?.dispose()
+
+            // 3. Disable and dispose tracks (releases native mic/camera handles)
+            try { localAudioTrack?.setEnabled(false) } catch (_: Exception) {}
+            try { localVideoTrack?.setEnabled(false) } catch (_: Exception) {}
+            try { localAudioTrack?.dispose() } catch (_: Exception) {}
+            try { localVideoTrack?.dispose() } catch (_: Exception) {}
+            localAudioTrack = null
+            localVideoTrack = null
+            remoteVideoTrack = null
+
+            // 4. Dispose sources (audio source releases the internal AudioRecord)
+            try { audioSource?.dispose() } catch (_: Exception) {}
+            try { videoSource?.dispose() } catch (_: Exception) {}
+            audioSource = null
+            videoSource = null
+
+            // 5. Dispose capturer and surface texture helper
+            try { videoCapturer?.dispose() } catch (_: Exception) {}
+            try { surfaceTextureHelper?.dispose() } catch (_: Exception) {}
+            videoCapturer = null
+            surfaceTextureHelper = null
+
+            // 6. Dispose factory (releases internal JavaAudioDeviceModule)
+            try { peerConnectionFactory?.dispose() } catch (_: Exception) {}
             peerConnectionFactory = null
+
+            // 7. Release EGL context last (renderers must be released before this!)
             try { eglBase?.release() } catch (_: Exception) {}
             eglBase = null
+
+            remoteRenderer = null
+            log.d("WebRTCClient disposed successfully")
         } catch (e: Exception) {
             log.e("Error disposing WebRTCClient: $e")
         }

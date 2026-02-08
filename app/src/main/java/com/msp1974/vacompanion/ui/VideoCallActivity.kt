@@ -2,6 +2,8 @@ package com.msp1974.vacompanion.ui
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -27,15 +29,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import android.view.ViewGroup
 import android.widget.FrameLayout
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
 import org.webrtc.SurfaceViewRenderer
 import com.msp1974.vacompanion.settings.APPConfig
@@ -48,6 +47,7 @@ import com.msp1974.vacompanion.webrtc.HASignalingListener
 import com.msp1974.vacompanion.webrtc.WebRTCClient
 import com.msp1974.vacompanion.webrtc.WebRTCListener
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.webrtc.IceCandidate
@@ -61,9 +61,6 @@ class VideoCallActivity : ComponentActivity() {
         override fun onEventTriggered(event: Event) {
             if (event.eventName == "callEnded") {
                 log.d("Received callEnded event — finishing VideoCallActivity")
-                val cfg = APPConfig.getInstance(this@VideoCallActivity)
-                cfg.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", true))
-                cfg.eventBroadcaster.notifyEvent(Event("resumeAudioInput", "", true))
                 finish()
             }
         }
@@ -95,7 +92,12 @@ class VideoCallActivity : ComponentActivity() {
     override fun onDestroy() {
         val config = APPConfig.getInstance(this)
         config.eventBroadcaster.removeListener(callEndedListener)
-        super.onDestroy()
+        super.onDestroy()   // triggers composable disposal → renderers.release() + WebRTC.dispose() + signaling.close()
+        // Resume background audio/motion after a generous delay to let native mic/camera fully release
+        Handler(Looper.getMainLooper()).postDelayed({
+            config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", true))
+            config.eventBroadcaster.notifyEvent(Event("resumeAudioInput", "", true))
+        }, 1000)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -120,9 +122,7 @@ class VideoCallActivity : ComponentActivity() {
                 )
             } catch (_: Exception) {}
         }
-        // Only notify local state change — do NOT re-emit vaca_call_ended here if we are reacting to one
-        config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", true))
-        config.eventBroadcaster.notifyEvent(Event("resumeAudioInput", "", true))
+        // Cleanup (WebRTC dispose, resumeAudioInput) handled by onDestroy → composable lifecycle
         finish()
     }
 
@@ -177,7 +177,6 @@ private suspend fun createWebRtcClient(
 @Composable
 fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
     val ctx = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
     val config = APPConfig.getInstance(ctx)
     val scope = rememberCoroutineScope()
 
@@ -222,12 +221,8 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
             }
 
             override fun onCallEndedReceived(data: JSONObject) {
-                // Handled by ForegroundService → callEnded event → callEndedListener.
-                // Do NOT call onBack() here — that fires another vaca_call_ended and causes an infinite loop.
-                scope.launch {
-                    webRtcClient?.dispose()
-                    webRtcClient = null
-                }
+                // Handled by ForegroundService → callEnded event → callEndedListener → finish().
+                // WebRTC disposal is handled by composable lifecycle (DisposableEffect).
             }
         }
     }
@@ -244,14 +239,18 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
         if (!initialTarget.isNullOrEmpty()) {
             callingTarget = initialTarget
 
+            // Pause background audio BEFORE creating WebRTC so the mic is free
+            // (needed on Android < 10 which lacks concurrent audio capture)
+            config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", false))
+            config.eventBroadcaster.notifyEvent(Event("pauseAudioInput", "", true))
+            delay(600)  // give BackgroundTask time to release the mic
+
             val webrtc = createWebRtcClient(ctx, config, initialTarget, sig)
             webRtcClient = webrtc
             remoteRendererRef?.let { webrtc.setRemoteRenderer(it) }
             localRendererRef?.let { webrtc.startLocalVideo(it) }
             webrtc.createOffer()
 
-            config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", false))
-            config.eventBroadcaster.notifyEvent(Event("pauseAudioInput", "", true))
             isInCall = true
         }
 
@@ -263,6 +262,11 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
             val sdp = act?.intent?.getStringExtra("offer_sdp")
             if (!caller.isNullOrEmpty() && !sdp.isNullOrEmpty()) {
                 try {
+                    // Pause background audio BEFORE creating WebRTC
+                    config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", false))
+                    config.eventBroadcaster.notifyEvent(Event("pauseAudioInput", "", true))
+                    delay(600)  // give BackgroundTask time to release the mic
+
                     val webrtc = createWebRtcClient(ctx, config, caller, sig)
                     webRtcClient = webrtc
                     remoteRendererRef?.let { webrtc.setRemoteRenderer(it) }
@@ -272,8 +276,6 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
 
                     isInCall = true
                     callingTarget = caller
-                    config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", false))
-                    config.eventBroadcaster.notifyEvent(Event("pauseAudioInput", "", true))
                 } catch (e: Exception) { Logger().e("Auto-accept error: $e") }
                 act.intent.removeExtra("auto_accept")
             }
@@ -293,16 +295,18 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
         client.setRemoteRenderer(renderer)
     }
 
-    // Lifecycle cleanup
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_DESTROY) {
-                webRtcClient?.dispose()
-                webRtcClient = null
-            }
+    // Cleanup: release renderers, dispose WebRTC, close signaling when composable is destroyed
+    DisposableEffect(Unit) {
+        onDispose {
+            // Release renderers FIRST — they hold EGL surfaces that depend on eglBase
+            webRtcClient?.releaseRenderers(localRendererRef, remoteRendererRef)
+            // Dispose WebRTC (closes PC, disposes tracks/sources/factory, releases EGL)
+            webRtcClient?.dispose()
+            webRtcClient = null
+            // Close the per-call signaling WebSocket
+            signalingClient?.close()
+            signalingClient = null
         }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     // -----------------------------------------------------------------------

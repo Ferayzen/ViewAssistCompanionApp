@@ -242,9 +242,15 @@ internal class BackgroundTaskController (private val context: Context): EventLis
             "resumeAudioInput" -> {
                 // Restore the microphone after a WebRTC call ends
                 Timber.i("Resuming audio input after WebRTC call")
-                if (server.pipelineClient != null) {
-                    startOpenWakeWordDetection()
-                    startInputAudio()
+                scope.launch {
+                    // Wait for WebRTC's native AudioRecord to fully release.
+                    // PeerConnectionFactory.dispose() triggers JavaAudioDeviceModule cleanup
+                    // which can take several hundred ms on older devices.
+                    delay(500)
+                    if (server.pipelineClient != null) {
+                        startOpenWakeWordDetection()
+                        startInputAudio()
+                    }
                 }
             }
             else -> consumed = false
@@ -335,7 +341,13 @@ internal class BackgroundTaskController (private val context: Context): EventLis
         if (audioInJob != null && audioInJob!!.isActive) {
             Timber.i("Stopping input audio")
             audioInJob?.cancel()
-            audioInJob = null
+            // Wait for the AudioRecorder's finally block (stop + release) to complete
+            // so the native microphone handle is actually freed before we return.
+            scope.launch {
+                try { audioInJob?.join() } catch (_: Exception) {}
+                audioInJob = null
+                Timber.i("Audio input fully stopped and mic released")
+            }
         }
     }
 
