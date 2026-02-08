@@ -56,7 +56,27 @@ import com.msp1974.vacompanion.utils.AuthUtils
 import com.msp1974.vacompanion.utils.Event
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CoroutineScope
 import org.json.JSONObject
+
+/** Fire a vaca_call_declined event to Home Assistant. */
+private fun fireDeclineEvent(caller: String, config: APPConfig, scope: CoroutineScope) {
+    scope.launch {
+        try {
+            val json = JSONObject().apply {
+                put("caller_uuid", caller)
+                put("target_device", config.uuid)
+            }
+            AuthUtils.haPostEvent(
+                AuthUtils.getHAUrl(config, false),
+                "vaca_call_declined",
+                json.toString(),
+                config.accessToken,
+                !config.ignoreSSLErrors
+            )
+        } catch (_: Exception) {}
+    }
+}
 
 @Composable
 fun WebViewScreen (webView: WebView, vaViewModel: VAViewModel = viewModel()) {
@@ -159,25 +179,9 @@ fun WebViewScreen (webView: WebView, vaViewModel: VAViewModel = viewModel()) {
                 },
                 onDecline = {
                     val caller = vaUiState.incomingCallCaller
-                    // Dismiss overlay
                     config.eventBroadcaster.notifyEvent(Event("incomingCallDismiss", "", ""))
-                    // Fire decline event to HA
                     if (caller != null) {
-                        scope.launch {
-                            try {
-                                val json = JSONObject().apply {
-                                    put("caller_uuid", caller)
-                                    put("target_device", config.uuid)
-                                }
-                                AuthUtils.haPostEvent(
-                                    AuthUtils.getHAUrl(config, false),
-                                    "vaca_call_declined",
-                                    json.toString(),
-                                    config.accessToken,
-                                    !config.ignoreSSLErrors
-                                )
-                            } catch (_: Exception) {}
-                        }
+                        fireDeclineEvent(caller, config, scope)
                     }
                 }
             )
@@ -192,19 +196,7 @@ fun WebViewScreen (webView: WebView, vaViewModel: VAViewModel = viewModel()) {
                     val caller = vaUiState.incomingCallCaller
                     config.eventBroadcaster.notifyEvent(Event("incomingCallDismiss", "", ""))
                     if (caller != null) {
-                        try {
-                            val json = JSONObject().apply {
-                                put("caller_uuid", caller)
-                                put("target_device", config.uuid)
-                            }
-                            AuthUtils.haPostEvent(
-                                AuthUtils.getHAUrl(config, false),
-                                "vaca_call_declined",
-                                json.toString(),
-                                config.accessToken,
-                                !config.ignoreSSLErrors
-                            )
-                        } catch (_: Exception) {}
+                        fireDeclineEvent(caller, config, scope)
                     }
                 }
             }

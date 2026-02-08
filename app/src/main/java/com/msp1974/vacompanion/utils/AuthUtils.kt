@@ -267,11 +267,8 @@ class AuthUtils(val config: APPConfig) {
 
         }
 
-        fun httpPOST(url: String, parameters: HashMap<String, String>, verifySSL: Boolean = true): String {
+        private fun buildHttpClient(verifySSL: Boolean): OkHttpClient {
             val clientBuilder = OkHttpClient.Builder()
-            val builder = FormBody.Builder()
-            val it = parameters.entries.iterator()
-
             if (!verifySSL) {
                 val sslContext = SSLContext.getInstance("SSL")
                 sslContext.init(null, trustAllCerts, java.security.SecureRandom())
@@ -281,7 +278,14 @@ class AuthUtils(val config: APPConfig) {
                 )
                 clientBuilder.hostnameVerifier { hostname, session -> true }
             }
-            val client = clientBuilder.build()
+            return clientBuilder.build()
+        }
+
+        fun httpPOST(url: String, parameters: HashMap<String, String>, verifySSL: Boolean = true): String {
+            val builder = FormBody.Builder()
+            val it = parameters.entries.iterator()
+
+            val client = buildHttpClient(verifySSL)
 
 
             while (it.hasNext()) {
@@ -311,19 +315,7 @@ class AuthUtils(val config: APPConfig) {
 
         // Perform a GET request to Home Assistant API using stored access token
         fun haGet(url: String, config: APPConfig, verifySSL: Boolean = true): String {
-            val clientBuilder = OkHttpClient.Builder()
-
-            if (!verifySSL) {
-                val sslContext = SSLContext.getInstance("SSL")
-                sslContext.init(null, trustAllCerts, java.security.SecureRandom())
-                clientBuilder.sslSocketFactory(
-                    sslContext.socketFactory,
-                    trustAllCerts[0] as X509TrustManager
-                )
-                clientBuilder.hostnameVerifier { hostname, session -> true }
-            }
-
-            val client = clientBuilder.build()
+            val client = buildHttpClient(verifySSL)
             val request = Request.Builder()
                 .url(url)
                 .addHeader("Authorization", "Bearer ${config.accessToken}")
@@ -346,19 +338,7 @@ class AuthUtils(val config: APPConfig) {
 
         // Post an event to Home Assistant (eg. /api/events/<event_type>)
         fun haPostEvent(baseUrl: String, eventType: String, jsonBody: String, token: String, verifySSL: Boolean = true): Boolean {
-            val clientBuilder = OkHttpClient.Builder()
-
-            if (!verifySSL) {
-                val sslContext = SSLContext.getInstance("SSL")
-                sslContext.init(null, trustAllCerts, java.security.SecureRandom())
-                clientBuilder.sslSocketFactory(
-                    sslContext.socketFactory,
-                    trustAllCerts[0] as X509TrustManager
-                )
-                clientBuilder.hostnameVerifier { hostname, session -> true }
-            }
-
-            val client = clientBuilder.build()
+            val client = buildHttpClient(verifySSL)
             val mediaType = "application/json; charset=utf-8".toMediaType()
             val body = jsonBody.toRequestBody(mediaType)
             val url = baseUrl.removeSuffix("/") + "/api/events/" + eventType

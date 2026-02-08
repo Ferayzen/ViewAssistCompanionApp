@@ -23,7 +23,6 @@ import com.google.firebase.crashlytics.crashlytics
 import com.msp1974.vacompanion.MainActivity
 import com.msp1974.vacompanion.R
 import com.msp1974.vacompanion.VACAApplication
-import com.msp1974.vacompanion.call.CallNotifications
 import com.msp1974.vacompanion.settings.APPConfig
 import com.msp1974.vacompanion.settings.BackgroundTaskStatus
 import com.msp1974.vacompanion.ui.VideoCallActivity
@@ -32,7 +31,6 @@ import com.msp1974.vacompanion.utils.EventListener
 import com.msp1974.vacompanion.utils.Logger
 import com.msp1974.vacompanion.webrtc.HASignalingClient
 import com.msp1974.vacompanion.webrtc.HASignalingListener
-import com.msp1974.vacompanion.webrtc.WebRTCClient
 import com.msp1974.vacompanion.utils.AuthUtils
 import org.json.JSONObject
 import timber.log.Timber

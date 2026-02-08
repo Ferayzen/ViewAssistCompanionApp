@@ -1,6 +1,5 @@
 package com.msp1974.vacompanion.webrtc
 
-import android.net.Uri
 import com.msp1974.vacompanion.settings.APPConfig
 import com.msp1974.vacompanion.utils.AuthUtils
 import com.msp1974.vacompanion.utils.Logger
