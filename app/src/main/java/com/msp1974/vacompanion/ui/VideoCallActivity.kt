@@ -46,6 +46,7 @@ import com.msp1974.vacompanion.webrtc.WebRTCClient
 import com.msp1974.vacompanion.webrtc.WebRTCListener
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.webrtc.IceCandidate
@@ -166,8 +167,20 @@ private suspend fun createWebRtcClient(
 
         override fun onRemoteStreamAvailable() {}
     })
-    client.init()
-    client.createPeerConnection()
+    try {
+        client.init()
+        client.createPeerConnection()
+        // Check for cancellation after synchronous init completes.
+        // If the coroutine was cancelled while the blocking code above ran,
+        // this throws CancellationException so the catch block can clean up.
+        ensureActive()
+    } catch (e: Exception) {
+        // Dispose everything that was initialised (factory, EGL, audio module, etc.)
+        // before propagating the error.  Without this, a partially-initialised client
+        // leaks the native audio device module and corrupts WebRTC state for future calls.
+        client.dispose()
+        throw e
+    }
     client
 }
 
@@ -242,13 +255,24 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
             config.eventBroadcaster.notifyEvent(Event("pauseAudioInput", "", true))
             delay(600)  // give BackgroundTask time to release the mic
 
-            val webrtc = createWebRtcClient(ctx, config, initialTarget, sig)
-            webRtcClient = webrtc
-            remoteRendererRef?.let { webrtc.setRemoteRenderer(it) }
-            localRendererRef?.let { webrtc.startLocalVideo(it) }
-            webrtc.createOffer()
-
-            isInCall = true
+            try {
+                val webrtc = createWebRtcClient(ctx, config, initialTarget, sig)
+                webRtcClient = webrtc
+                remoteRendererRef?.let { webrtc.setRemoteRenderer(it) }
+                localRendererRef?.let { webrtc.startLocalVideo(it) }
+                webrtc.createOffer()
+                isInCall = true
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Coroutine cancelled (activity finishing) — createWebRtcClient
+                // already disposed the client.  Re-throw so structured concurrency works.
+                throw e
+            } catch (e: Exception) {
+                Logger().e("Outgoing call setup error: $e")
+                // createWebRtcClient already disposed the partially-init'd client.
+                // Resume audio so the assistant isn't permanently muted.
+                config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", true))
+                config.eventBroadcaster.notifyEvent(Event("resumeAudioInput", "", true))
+            }
         }
 
         // --- Incoming call (auto-accept from in-app overlay) ---------------
@@ -273,7 +297,13 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
 
                     isInCall = true
                     callingTarget = caller
-                } catch (e: Exception) { Logger().e("Auto-accept error: $e") }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Logger().e("Auto-accept error: $e")
+                    config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", true))
+                    config.eventBroadcaster.notifyEvent(Event("resumeAudioInput", "", true))
+                }
                 act.intent.removeExtra("auto_accept")
             }
         }

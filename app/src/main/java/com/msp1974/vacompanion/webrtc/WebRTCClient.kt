@@ -3,6 +3,7 @@ package com.msp1974.vacompanion.webrtc
 import android.content.Context
 import com.msp1974.vacompanion.utils.Logger
 import org.webrtc.*
+import org.webrtc.audio.JavaAudioDeviceModule
 
 interface WebRTCListener {
     fun onLocalSdp(type: String, sdp: String)
@@ -12,10 +13,27 @@ interface WebRTCListener {
 
 class WebRTCClient(private val ctx: Context, private val listener: WebRTCListener) {
     private val log = Logger()
+
+    companion object {
+        @Volatile
+        private var nativeInitialized = false
+
+        @Synchronized
+        private fun initializeNative(ctx: Context) {
+            if (!nativeInitialized) {
+                val initOptions = PeerConnectionFactory.InitializationOptions.builder(ctx.applicationContext)
+                    .createInitializationOptions()
+                PeerConnectionFactory.initialize(initOptions)
+                nativeInitialized = true
+            }
+        }
+    }
+
     // EGL context — only created when video is enabled (API >= 28)
     private var eglBase: EglBase? = null
     private var peerConnectionFactory: PeerConnectionFactory? = null
     private var peerConnection: PeerConnection? = null
+    private var audioDeviceModule: JavaAudioDeviceModule? = null
 
     private var localVideoTrack: VideoTrack? = null
     private var localAudioTrack: AudioTrack? = null
@@ -36,19 +54,26 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
     fun getEglContext(): EglBase.Context? = eglBase?.eglBaseContext
 
     fun init() {
-        val initializationOptions = PeerConnectionFactory.InitializationOptions.builder(ctx)
-            .createInitializationOptions()
-        PeerConnectionFactory.initialize(initializationOptions)
-
-        val options = PeerConnectionFactory.Options()
+        // Native init is process-global and must only happen once.
+        // Calling initialize() after a previous factory.dispose() can corrupt
+        // the internal audio tracer on some older devices.
+        initializeNative(ctx)
 
         eglBase = EglBase.create()
         log.d("WebRTC init — EGL + HW codecs")
+
+        // Create an explicit AudioDeviceModule so we have full control over its
+        // lifecycle.  Without this the factory creates a default one internally
+        // whose release is implicit and can silently fail on some devices.
+        audioDeviceModule = JavaAudioDeviceModule.builder(ctx)
+            .createAudioDeviceModule()
+
         val encoderFactory = DefaultVideoEncoderFactory(eglBase!!.eglBaseContext, true, true)
         val decoderFactory = DefaultVideoDecoderFactory(eglBase!!.eglBaseContext)
 
         peerConnectionFactory = PeerConnectionFactory.builder()
-            .setOptions(options)
+            .setOptions(PeerConnectionFactory.Options())
+            .setAudioDeviceModule(audioDeviceModule)
             .setVideoEncoderFactory(encoderFactory)
             .setVideoDecoderFactory(decoderFactory)
             .createPeerConnectionFactory()
@@ -409,11 +434,15 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
             videoCapturer = null
             surfaceTextureHelper = null
 
-            // 6. Dispose factory (releases internal JavaAudioDeviceModule)
+            // 6. Release the explicit audio device module (releases native AudioRecord/AudioTrack)
+            try { audioDeviceModule?.release() } catch (_: Exception) {}
+            audioDeviceModule = null
+
+            // 7. Dispose factory
             try { peerConnectionFactory?.dispose() } catch (_: Exception) {}
             peerConnectionFactory = null
 
-            // 7. Release EGL context last (renderers must be released before this!)
+            // 8. Release EGL context last (renderers must be released before this!)
             try { eglBase?.release() } catch (_: Exception) {}
             eglBase = null
 

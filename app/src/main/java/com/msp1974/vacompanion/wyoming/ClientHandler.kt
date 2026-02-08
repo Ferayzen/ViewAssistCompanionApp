@@ -83,9 +83,14 @@ class ClientHandler(private val context: Context, private val server: WyomingTCP
                                 actionAlarm(false)
                             }
                             else -> {
-                                volumeDucking("all", true)
-                                sendWakeWordDetection()
-                                sendStartPipeline()
+                                // If an incoming call overlay is active the wake word
+                                // is only used to accept the call — do NOT start the
+                                // assist pipeline.
+                                if (!config.incomingCallActive) {
+                                    volumeDucking("all", true)
+                                    sendWakeWordDetection()
+                                    sendStartPipeline()
+                                }
                             }
                         }
                     }

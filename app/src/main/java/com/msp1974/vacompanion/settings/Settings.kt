@@ -81,6 +81,10 @@ class APPConfig(val context: Context) {
     var hasWriteExternalStoragePermission: Boolean = false
     var hasCameraPermission: Boolean = false
 
+    // Incoming call overlay is active — wake word should accept the call
+    // rather than triggering the assist pipeline
+    @Volatile var incomingCallActive: Boolean = false
+
     var ignoreSSLErrors: Boolean = alwaysIgnoreSSLErrors
 
     //In memory settings with change notification

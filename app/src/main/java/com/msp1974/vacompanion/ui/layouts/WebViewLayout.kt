@@ -1,6 +1,9 @@
 package com.msp1974.vacompanion.ui.layouts
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.media.RingtoneManager
 import android.view.ViewGroup
 import android.webkit.WebView
@@ -46,6 +49,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import com.msp1974.vacompanion.broadcasts.BroadcastSender
 import com.msp1974.vacompanion.service.VAForegroundService
 import com.msp1974.vacompanion.settings.APPConfig
 import com.msp1974.vacompanion.settings.PageLoadingStage
@@ -57,6 +61,7 @@ import com.msp1974.vacompanion.utils.Event
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CoroutineScope
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import org.json.JSONObject
 
 /** Fire a vaca_call_declined event to Home Assistant. */
@@ -213,12 +218,37 @@ private fun IncomingCallOverlay(
 ) {
     val ctx = LocalContext.current
 
-    // Play ringtone while overlay is visible; stop on dispose (accept/decline/timeout)
+    // Accept the call when the wake word is detected during a ringtone gap
     DisposableEffect(Unit) {
-        val ringtoneUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-        val ringtone = RingtoneManager.getRingtone(ctx, ringtoneUri)
-        ringtone?.play()
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                onAccept()
+            }
+        }
+        LocalBroadcastManager.getInstance(ctx)
+            .registerReceiver(receiver, IntentFilter(BroadcastSender.WAKE_WORD_DETECTED))
         onDispose {
+            LocalBroadcastManager.getInstance(ctx).unregisterReceiver(receiver)
+        }
+    }
+
+    // Play ringtone in a pulsed pattern (ring ~2s, silence ~4s) so the wake word
+    // detector can still hear the user during the silent gaps.
+    val ringtone = remember {
+        val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+        RingtoneManager.getRingtone(ctx, uri)
+    }
+
+    LaunchedEffect(Unit) {
+        try {
+            while (true) {
+                ringtone?.play()
+                delay(2000)          // ring for ~2 seconds
+                try { ringtone?.stop() } catch (_: Exception) {}
+                delay(4000)          // silence for ~4 seconds (wake word window)
+            }
+        } finally {
+            // Composable leaving — make sure ringtone is stopped
             try { ringtone?.stop() } catch (_: Exception) {}
         }
     }

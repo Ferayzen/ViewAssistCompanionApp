@@ -233,6 +233,12 @@ internal class BackgroundTaskController (private val context: Context): EventLis
                     }
                 }
             }
+            "incomingCall" -> {
+                config.incomingCallActive = true
+            }
+            "incomingCallDismiss", "callEnded" -> {
+                config.incomingCallActive = false
+            }
             "pauseAudioInput" -> {
                 // Release the microphone so WebRTC can use it (needed on Android < 10
                 // which does not support concurrent audio recording sessions)
@@ -423,6 +429,15 @@ internal class BackgroundTaskController (private val context: Context): EventLis
                                 "prediction" to detection.score.toString()
                             )
                         )
+                        if (config.incomingCallActive) {
+                            // Incoming call overlay is showing — only send the broadcast
+                            // so the overlay can accept the call.  Do NOT trigger the
+                            // assist pipeline, wake sound, or screen-on.
+                            Timber.i("Wake word detected during incoming call — accepting call")
+                            BroadcastSender.sendBroadcast(context, BroadcastSender.WAKE_WORD_DETECTED)
+                            return@collect
+                        }
+
                         // if wake up on ww, send event
                         if (config.screenOnWakeWord) {
                             config.eventBroadcaster.notifyEvent(Event("screenWake", "", ""))
