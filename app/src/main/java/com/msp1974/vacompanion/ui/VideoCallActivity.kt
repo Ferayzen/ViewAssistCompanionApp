@@ -2,8 +2,6 @@ package com.msp1974.vacompanion.ui
 
 import android.content.Intent
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -93,11 +91,10 @@ class VideoCallActivity : ComponentActivity() {
         val config = APPConfig.getInstance(this)
         config.eventBroadcaster.removeListener(callEndedListener)
         super.onDestroy()   // triggers composable disposal → renderers.release() + WebRTC.dispose() + signaling.close()
-        // Resume background audio/motion after a generous delay to let native mic/camera fully release
-        Handler(Looper.getMainLooper()).postDelayed({
-            config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", true))
-            config.eventBroadcaster.notifyEvent(Event("resumeAudioInput", "", true))
-        }, 1000)
+        // Fire resume/enable immediately — BackgroundTask handles the internal delay
+        // before actually reopening the mic, so a rapid new pauseAudioInput can cancel it.
+        config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", true))
+        config.eventBroadcaster.notifyEvent(Event("resumeAudioInput", "", true))
     }
 
     override fun onNewIntent(intent: Intent) {

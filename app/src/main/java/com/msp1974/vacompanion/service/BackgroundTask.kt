@@ -50,6 +50,7 @@ internal class BackgroundTaskController (private val context: Context): EventLis
     private val job = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.Default + job)
     private var audioInJob: Job? = null
+    private var audioResumeJob: Job? = null
     private var wakeWordJob: Job? = null
     private var wakeWordEngine: WakeWordEngine? = null
     private var holdDetectionLevelJob: Job? = null
@@ -236,17 +237,24 @@ internal class BackgroundTaskController (private val context: Context): EventLis
                 // Release the microphone so WebRTC can use it (needed on Android < 10
                 // which does not support concurrent audio recording sessions)
                 Timber.i("Pausing audio input for WebRTC call")
+                // Cancel any pending resume from a previous call that hasn't fired yet.
+                // This prevents the old resume from re-opening the mic after *this* pause.
+                audioResumeJob?.cancel()
+                audioResumeJob = null
                 stopOpenWakeWordDetection()
                 stopInputAudio()
             }
             "resumeAudioInput" -> {
-                // Restore the microphone after a WebRTC call ends
-                Timber.i("Resuming audio input after WebRTC call")
-                scope.launch {
+                // Restore the microphone after a WebRTC call ends.
+                // The delay is handled here so that a subsequent pauseAudioInput can cancel it.
+                Timber.i("Resuming audio input after WebRTC call (delayed)")
+                audioResumeJob?.cancel()
+                audioResumeJob = scope.launch {
                     // Wait for WebRTC's native AudioRecord to fully release.
                     // PeerConnectionFactory.dispose() triggers JavaAudioDeviceModule cleanup
                     // which can take several hundred ms on older devices.
-                    delay(500)
+                    delay(1500)
+                    Timber.i("Audio resume delay elapsed — restarting audio input")
                     if (server.pipelineClient != null) {
                         startOpenWakeWordDetection()
                         startInputAudio()
