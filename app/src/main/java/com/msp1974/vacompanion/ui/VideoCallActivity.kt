@@ -176,6 +176,18 @@ private suspend fun createWebRtcClient(
         }
 
         override fun onRemoteStreamAvailable() {}
+
+        override fun onAudioHealthCheckFailed() {
+            Logger().e("Audio health check failed — WebRTC mic broken, scheduling process restart")
+            // Show brief feedback then restart the process.
+            // ForegroundService uses START_STICKY + watchdog → auto-recovery.
+            try {
+                Toast.makeText(ctx, "Audio error detected — restarting…", Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {}
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                Runtime.getRuntime().exit(1)
+            }, 1500)
+        }
     })
     try {
         client.init()
@@ -335,14 +347,28 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
     // Cleanup: release renderers, dispose WebRTC, close signaling when composable is destroyed
     DisposableEffect(Unit) {
         onDispose {
-            // Release renderers FIRST — they hold EGL surfaces that depend on eglBase
-            webRtcClient?.releaseRenderers(localRendererRef, remoteRendererRef)
-            // Dispose WebRTC (closes PC, disposes tracks/sources/factory, releases EGL)
-            webRtcClient?.dispose()
+            // Capture references — composable state is torn down after onDispose
+            val rtc = webRtcClient
+            val sig = signalingClient
+            val localR = localRendererRef
+            val remoteR = remoteRendererRef
             webRtcClient = null
-            // Close the per-call signaling WebSocket
-            signalingClient?.close()
             signalingClient = null
+
+            // Release renderers on the main thread (they're Views, must be on UI thread)
+            rtc?.releaseRenderers(localR, remoteR)
+
+            // Dispose WebRTC on a background thread — heavy native teardown
+            // (PC dispose, factory dispose, EGL release) must not run on
+            // the main thread or it can block/deadlock during Activity teardown.
+            Thread {
+                try {
+                    rtc?.dispose()
+                } catch (_: Exception) {}
+                try {
+                    sig?.close()
+                } catch (_: Exception) {}
+            }.start()
         }
     }
 

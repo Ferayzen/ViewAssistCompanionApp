@@ -33,8 +33,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
@@ -361,15 +359,16 @@ internal class BackgroundTaskController (private val context: Context): EventLis
         }
         Timber.i("Stopping input audio")
         job.cancel()
-        // Synchronously wait for the AudioRecorder's finally block (stop + release)
+        // Wait for the AudioRecorder's finally block (stop + release) to complete
         // so the native microphone handle is actually freed before we return.
-        // Without this, WebRTC's JavaAudioDeviceModule may fail to open its own
-        // AudioRecord on Android < 10 (no concurrent capture support).
-        try {
-            runBlocking {
-                withTimeout(3000) { job.join() }
-            }
-        } catch (_: Exception) {
+        // Uses Thread.sleep loop instead of runBlocking to avoid deadlocking the
+        // main thread (EventNotifier delivers events synchronously on the caller's
+        // thread, which may be the main thread).
+        val deadline = System.currentTimeMillis() + 3000
+        while (job.isActive && System.currentTimeMillis() < deadline) {
+            try { Thread.sleep(50) } catch (_: InterruptedException) { break }
+        }
+        if (job.isActive) {
             Timber.w("Timed out waiting for audio input to stop")
         }
         audioInJob = null

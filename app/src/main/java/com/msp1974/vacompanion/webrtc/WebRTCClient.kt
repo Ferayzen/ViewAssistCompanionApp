@@ -4,30 +4,19 @@ import android.content.Context
 import com.msp1974.vacompanion.utils.Logger
 import org.webrtc.*
 import org.webrtc.audio.JavaAudioDeviceModule
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 interface WebRTCListener {
     fun onLocalSdp(type: String, sdp: String)
     fun onIceCandidate(candidate: IceCandidate)
     fun onRemoteStreamAvailable()
+    fun onAudioHealthCheckFailed()
 }
 
 class WebRTCClient(private val ctx: Context, private val listener: WebRTCListener) {
     private val log = Logger()
-
-    companion object {
-        @Volatile
-        private var nativeInitialized = false
-
-        @Synchronized
-        private fun initializeNative(ctx: Context) {
-            if (!nativeInitialized) {
-                val initOptions = PeerConnectionFactory.InitializationOptions.builder(ctx.applicationContext)
-                    .createInitializationOptions()
-                PeerConnectionFactory.initialize(initOptions)
-                nativeInitialized = true
-            }
-        }
-    }
 
     // EGL context — only created when video is enabled (API >= 28)
     private var eglBase: EglBase? = null
@@ -48,16 +37,19 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
     private var localCapturing = false
     private var localRendererAttached = false
     private var remoteRendererInitialized = false
-    private var disposed = false
+    @Volatile private var disposed = false
+    private var audioHealthThread: Thread? = null
 
     /** Expose the shared EGL context so renderers can be pre-initialised. */
     fun getEglContext(): EglBase.Context? = eglBase?.eglBaseContext
 
     fun init() {
-        // Native init is process-global and must only happen once.
-        // Calling initialize() after a previous factory.dispose() can corrupt
-        // the internal audio tracer on some older devices.
-        initializeNative(ctx)
+        // Always (re-)initialize — PeerConnectionFactory.dispose() shuts down
+        // the internal tracer, so a fresh initialize() is required before
+        // creating the next factory.  The native library load is idempotent.
+        val initOptions = PeerConnectionFactory.InitializationOptions.builder(ctx.applicationContext)
+            .createInitializationOptions()
+        PeerConnectionFactory.initialize(initOptions)
 
         eglBase = EglBase.create()
         log.d("WebRTC init — EGL + HW codecs")
@@ -98,6 +90,9 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
             }
             override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState) {
                 log.d("PC iceConnectionState -> $newState")
+                if (newState == PeerConnection.IceConnectionState.CONNECTED) {
+                    startAudioHealthCheck()
+                }
             }
             override fun onIceConnectionReceivingChange(p0: Boolean) {}
             override fun onIceGatheringChange(p0: PeerConnection.IceGatheringState) {}
@@ -385,6 +380,81 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
         peerConnection?.addIceCandidate(candidate)
     }
 
+    // ---- Audio health monitor ------------------------------------------------
+    // After ICE connects, verify outbound audio bytes are increasing.  If not,
+    // the JavaAudioDeviceModule likely failed to open its internal AudioRecord
+    // (process-level native state corruption from a previous call).  In that case
+    // the only recovery is a process restart.
+    private fun startAudioHealthCheck() {
+        if (disposed) return
+        audioHealthThread = thread(name = "WebRTC-AudioHealthCheck", isDaemon = true) {
+            try {
+                // Wait for the audio pipeline to fully start
+                Thread.sleep(7000)
+                if (disposed) return@thread
+
+                val first = queryOutboundAudioBytes()
+                if (first < 0 || disposed) return@thread
+
+                Thread.sleep(3000)
+                if (disposed) return@thread
+
+                val second = queryOutboundAudioBytes()
+                if (second < 0 || disposed) return@thread
+
+                if (second <= first) {
+                    log.e("AUDIO HEALTH CHECK FAILED: outbound audio bytes $first → $second (not increasing)")
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        if (!disposed) listener.onAudioHealthCheckFailed()
+                    }
+                } else {
+                    log.d("Audio health check passed: $first → $second bytes sent")
+                }
+            } catch (_: InterruptedException) {
+                // Interrupted during dispose — exit silently
+            } catch (e: Exception) {
+                log.e("Audio health check error: $e")
+            }
+        }
+    }
+
+    /**
+     * Query the number of outbound audio bytes via PeerConnection.getStats().
+     * Blocks the calling thread until stats arrive or a 3-second timeout elapses.
+     * Returns -1 if stats are unavailable.
+     */
+    private fun queryOutboundAudioBytes(): Long {
+        val pc = peerConnection ?: return -1
+        var result = -1L
+        val latch = CountDownLatch(1)
+        try {
+            pc.getStats { report ->
+                try {
+                    for (stats in report.statsMap.values) {
+                        if (stats.type == "outbound-rtp") {
+                            val kind = stats.members["kind"]
+                            if (kind == "audio") {
+                                val bytes = stats.members["bytesSent"]
+                                result = when (bytes) {
+                                    is Long -> bytes
+                                    is Number -> bytes.toLong()
+                                    is java.math.BigInteger -> bytes.toLong()
+                                    else -> -1L
+                                }
+                                break
+                            }
+                        }
+                    }
+                } catch (_: Exception) {}
+                latch.countDown()
+            }
+        } catch (_: Exception) {
+            return -1
+        }
+        latch.await(3, TimeUnit.SECONDS)
+        return result
+    }
+
     /**
      * Release SurfaceViewRenderers. Must be called BEFORE [dispose] because
      * renderers depend on the EGL context that dispose() releases.
@@ -403,15 +473,24 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
         if (disposed) return
         disposed = true
         log.d("Disposing WebRTCClient")
+
+        // Cancel audio health check thread
+        audioHealthThread?.interrupt()
+        audioHealthThread = null
         try {
             // 1. Stop camera capture (but don't dispose capturer yet)
             stopLocalVideo()
 
-            // 2. Close peer connection FIRST — detaches tracks from transceivers internally.
-            //    This must happen before disposing tracks/sources or native resources
-            //    may not be properly released on older devices.
-            try { peerConnection?.close() } catch (_: Exception) {}
+            // 2. Dispose peer connection — close() shuts down the connection but
+            //    dispose() also frees native memory.  Without dispose(), the GC
+            //    destructor fires unpredictably and accesses already-released
+            //    audio/video resources, corrupting WebRTC’s internal state.
+            try { peerConnection?.dispose() } catch (_: Exception) {}
             peerConnection = null
+
+            // Small pause to let native teardown finish on the signaling thread
+            // before we release resources it may still be referencing.
+            try { Thread.sleep(100) } catch (_: Exception) {}
 
             // 3. Disable and dispose tracks (releases native mic/camera handles)
             try { localAudioTrack?.setEnabled(false) } catch (_: Exception) {}
