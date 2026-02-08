@@ -71,6 +71,13 @@ class VideoCallActivity : ComponentActivity() {
         val config = APPConfig.getInstance(this)
         config.eventBroadcaster.addListener(callEndedListener)
 
+        // Keep the screen active while a call is ongoing
+        try {
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } catch (_: Exception) {}
+        // Also notify MainActivity to set screenAlwaysOn in case that code path is active
+        config.eventBroadcaster.notifyEvent(Event("screenAlwaysOn", "", true))
+
         val initialTarget = extractTargetFromIntent(intent)
 
         setContent {
@@ -91,6 +98,9 @@ class VideoCallActivity : ComponentActivity() {
     override fun onDestroy() {
         val config = APPConfig.getInstance(this)
         config.eventBroadcaster.removeListener(callEndedListener)
+        // Restore screen setting
+        try { window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) } catch (_: Exception) {}
+        config.eventBroadcaster.notifyEvent(Event("screenAlwaysOn", "", config.screenAlwaysOn))
         super.onDestroy()   // triggers composable disposal → renderers.release() + WebRTC.dispose() + signaling.close()
         // Fire resume/enable immediately — BackgroundTask handles the internal delay
         // before actually reopening the mic, so a rapid new pauseAudioInput can cancel it.
