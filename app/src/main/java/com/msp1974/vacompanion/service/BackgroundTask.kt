@@ -232,6 +232,21 @@ internal class BackgroundTaskController (private val context: Context): EventLis
                     }
                 }
             }
+            "pauseAudioInput" -> {
+                // Release the microphone so WebRTC can use it (needed on Android < 10
+                // which does not support concurrent audio recording sessions)
+                Timber.i("Pausing audio input for WebRTC call")
+                stopOpenWakeWordDetection()
+                stopInputAudio()
+            }
+            "resumeAudioInput" -> {
+                // Restore the microphone after a WebRTC call ends
+                Timber.i("Resuming audio input after WebRTC call")
+                if (server.pipelineClient != null) {
+                    startOpenWakeWordDetection()
+                    startInputAudio()
+                }
+            }
             else -> consumed = false
         }
         if (consumed) {

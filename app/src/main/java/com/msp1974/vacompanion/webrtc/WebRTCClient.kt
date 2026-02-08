@@ -130,7 +130,9 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
         val audioConstraints = MediaConstraints()
         val audioSource = peerConnectionFactory?.createAudioSource(audioConstraints)
         localAudioTrack = peerConnectionFactory?.createAudioTrack("ARDAMSa0", audioSource)
+        localAudioTrack?.setEnabled(true)
         peerConnection?.addTrack(localAudioTrack)
+        log.d("Audio track created, enabled=${localAudioTrack?.enabled()}, state=${localAudioTrack?.state()}")
 
         // ---- Video ----
         try {

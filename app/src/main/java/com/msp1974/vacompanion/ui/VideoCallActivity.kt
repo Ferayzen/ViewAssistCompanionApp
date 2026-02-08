@@ -61,6 +61,9 @@ class VideoCallActivity : ComponentActivity() {
         override fun onEventTriggered(event: Event) {
             if (event.eventName == "callEnded") {
                 log.d("Received callEnded event — finishing VideoCallActivity")
+                val cfg = APPConfig.getInstance(this@VideoCallActivity)
+                cfg.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", true))
+                cfg.eventBroadcaster.notifyEvent(Event("resumeAudioInput", "", true))
                 finish()
             }
         }
@@ -119,6 +122,7 @@ class VideoCallActivity : ComponentActivity() {
         }
         // Only notify local state change — do NOT re-emit vaca_call_ended here if we are reacting to one
         config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", true))
+        config.eventBroadcaster.notifyEvent(Event("resumeAudioInput", "", true))
         finish()
     }
 
@@ -247,6 +251,7 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
             webrtc.createOffer()
 
             config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", false))
+            config.eventBroadcaster.notifyEvent(Event("pauseAudioInput", "", true))
             isInCall = true
         }
 
@@ -268,6 +273,7 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
                     isInCall = true
                     callingTarget = caller
                     config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", false))
+                    config.eventBroadcaster.notifyEvent(Event("pauseAudioInput", "", true))
                 } catch (e: Exception) { Logger().e("Auto-accept error: $e") }
                 act.intent.removeExtra("auto_accept")
             }

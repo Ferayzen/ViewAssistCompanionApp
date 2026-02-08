@@ -84,6 +84,7 @@
         <activity
             android:name=".ui.VideoCallActivity"
             android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize"
             android:label="Video Call">
             <!-- Deep link so external integrations (eg. View Assist menu) can open the Video Call screen -->
             <intent-filter>
