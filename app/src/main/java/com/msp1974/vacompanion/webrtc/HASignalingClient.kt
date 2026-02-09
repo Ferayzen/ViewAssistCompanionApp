@@ -9,6 +9,7 @@ import kotlinx.coroutines.launch
 import okhttp3.*
 import okio.ByteString
 import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 interface HASignalingListener {
@@ -21,12 +22,19 @@ interface HASignalingListener {
     fun onCallEndedReceived(data: JSONObject) { }
     // Optional: called when the remote side declines the call
     fun onCallDeclinedReceived(data: JSONObject) { }
+    // Optional: called when the remote side confirms it is ringing
+    fun onCallRingingReceived(data: JSONObject) { }
 }
 
 class HASignalingClient(private val config: APPConfig, private val listener: HASignalingListener) {
     private val log = Logger()
     private var ws: WebSocket? = null
-    private val client = OkHttpClient()
+    // 30-second ping interval keeps the connection alive and lets OkHttp detect
+    // silent TCP death (NAT timeout, WiFi idle drop, HA restart without clean close).
+    // When a pong is not received, onFailure fires → statusCallback(false) → reconnect.
+    private val client = OkHttpClient.Builder()
+        .pingInterval(30, TimeUnit.SECONDS)
+        .build()
     private val idCounter = AtomicInteger(1)
 
     // Optional status callback to notify about connection/auth state changes
@@ -76,6 +84,7 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
                                 subscribeEvent(webSocket, "vaca_start_call")
                                 subscribeEvent(webSocket, "vaca_call_ended")
                                 subscribeEvent(webSocket, "vaca_call_declined")
+                                subscribeEvent(webSocket, "vaca_call_ringing")
                                 try { logCallback?.invoke("Subscribed to vaca_* events") } catch (e: Exception) {}
                                 // Notify that we are connected and authenticated
                                 try { statusCallback?.invoke(true) } catch (e: Exception) {}
@@ -108,6 +117,9 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
                                     }
                                     "vaca_call_declined" -> {
                                         try { listener.onCallDeclinedReceived(data) } catch (e: Exception) {}
+                                    }
+                                    "vaca_call_ringing" -> {
+                                        try { listener.onCallRingingReceived(data) } catch (e: Exception) {}
                                     }
                                     else -> {
                                         try { logCallback?.invoke("Unhandled event type: $eventType") } catch (e: Exception) {}
@@ -190,5 +202,13 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
             put("target_device", targetDevice)
         }
         AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_call_ended", json.toString(), config.accessToken, !config.ignoreSSLErrors)
+    }
+
+    fun sendCallRinging(callerUuid: String, targetDevice: String) {
+        val json = JSONObject().apply {
+            put("caller_uuid", callerUuid)
+            put("target_device", targetDevice)
+        }
+        AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_call_ringing", json.toString(), config.accessToken, !config.ignoreSSLErrors)
     }
 }

@@ -53,6 +53,8 @@ class VAForegroundService : Service() {
     private var signalingClient: HASignalingClient? = null
     private var signalingRetryHandler: Handler? = null
     private var signalingRetryRunnable: Runnable? = null
+    private var signalingHealthTimer: Timer? = null
+    @Volatile private var signalingConnected = false
 
     private val signalingEventListener = object : EventListener {
         override fun onEventTriggered(event: Event) {
@@ -378,10 +380,27 @@ class VAForegroundService : Service() {
                     Logger().e("Foreground signaling call-declined error: $e")
                 }
             }
+
+            override fun onCallRingingReceived(data: JSONObject) {
+                try {
+                    val caller = data.optString("caller_uuid", "")
+                    val target = data.optString("target_device", "")
+                    if (DEBUG_OVERLAY) {
+                        try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "call_ringing from $target for $caller")) } catch (e: Exception) {}
+                    }
+                    // If this device is the caller, notify UI that the target is ringing
+                    if (caller == config.uuid) {
+                        config.eventBroadcaster.notifyEvent(Event("callRinging", "", target))
+                    }
+                } catch (e: Exception) {
+                    Logger().e("Foreground signaling call-ringing error: $e")
+                }
+            }
         })
 
         signalingClient?.statusCallback = { connected ->
             Timber.d("Signaling status changed: $connected")
+            signalingConnected = connected
             if (DEBUG_OVERLAY) showDebugToast("Signaling: ${if (connected) "Connected" else "Disconnected"}")
             config.eventBroadcaster.notifyEvent(Event("signalingConnected", "", connected))
             if (!connected) {
@@ -399,9 +418,13 @@ class VAForegroundService : Service() {
 
         signalingClient?.connect()
         Timber.d("Foreground signaling client started")
+        startSignalingHealthCheck()
     }
 
     private fun stopSignalingClient() {
+        // cancel health check
+        signalingHealthTimer?.cancel()
+        signalingHealthTimer = null
         // cancel any pending retry
         if (signalingRetryHandler != null && signalingRetryRunnable != null) {
             signalingRetryHandler?.removeCallbacks(signalingRetryRunnable!!)
@@ -410,6 +433,7 @@ class VAForegroundService : Service() {
         }
         signalingClient?.close()
         signalingClient = null
+        signalingConnected = false
         Timber.d("Foreground signaling client stopped")
     }
 
@@ -432,6 +456,28 @@ class VAForegroundService : Service() {
             startSignalingClient()
         }
         signalingRetryHandler?.postDelayed(signalingRetryRunnable!!, delayMs)
+    }
+
+    /**
+     * Periodic health check: if the signaling WebSocket has been disconnected
+     * for too long with no pending reconnect, force a reconnect.
+     * Defense-in-depth against edge cases where statusCallback(false) is missed.
+     */
+    private fun startSignalingHealthCheck() {
+        signalingHealthTimer?.cancel()
+        signalingHealthTimer = Timer()
+        signalingHealthTimer?.schedule(object : TimerTask() {
+            override fun run() {
+                if (!signalingConnected && signalingClient == null
+                    && signalingRetryHandler == null
+                    && config.accessToken.isNotBlank()) {
+                    Timber.w("Signaling health check: not connected, no retry pending — forcing reconnect")
+                    Handler(Looper.getMainLooper()).post {
+                        startSignalingClient()
+                    }
+                }
+            }
+        }, 60_000, 60_000)  // check every 60 seconds
     }
 
     private fun isVideoCallActivityActive(): Boolean {

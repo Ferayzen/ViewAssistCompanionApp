@@ -77,6 +77,25 @@ private fun fireDeclineEvent(caller: String, config: APPConfig, scope: Coroutine
     }
 }
 
+/** Fire a vaca_call_ringing event to Home Assistant so the caller knows we're ringing. */
+private fun fireRingingEvent(caller: String, config: APPConfig, scope: CoroutineScope) {
+    scope.launch {
+        try {
+            val json = JSONObject().apply {
+                put("caller_uuid", caller)
+                put("target_device", config.uuid)
+            }
+            AuthUtils.haPostEvent(
+                AuthUtils.getHAUrl(config, false),
+                "vaca_call_ringing",
+                json.toString(),
+                config.accessToken,
+                !config.ignoreSSLErrors
+            )
+        } catch (_: Exception) {}
+    }
+}
+
 @Composable
 fun WebViewScreen (webView: WebView, vaViewModel: VAViewModel = viewModel()) {
     val vaUiState by vaViewModel.vacaState.collectAsState()
@@ -186,9 +205,12 @@ fun WebViewScreen (webView: WebView, vaViewModel: VAViewModel = viewModel()) {
             )
         }
 
-        // Auto-dismiss incoming call after 20 seconds
+        // Auto-dismiss incoming call after 20 seconds + notify caller we're ringing
         LaunchedEffect(vaUiState.incomingCallCaller) {
             if (vaUiState.incomingCallCaller != null) {
+                // Tell the caller that this device is now ringing
+                fireRingingEvent(vaUiState.incomingCallCaller!!, config, scope)
+
                 delay(20_000)
                 // If still showing, auto-decline
                 if (vaUiState.incomingCallCaller != null) {

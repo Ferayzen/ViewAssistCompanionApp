@@ -1,6 +1,8 @@
 package com.msp1974.vacompanion.ui
 
 import android.content.Intent
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -52,15 +54,20 @@ import kotlinx.coroutines.withContext
 import org.webrtc.IceCandidate
 import org.json.JSONObject
 
+/** Tracks the outgoing-call lifecycle visible to the caller. */
+private enum class OutgoingCallState { CONNECTING, RINGING, IN_CALL }
+
 class VideoCallActivity : ComponentActivity() {
     private val log = Logger()
 
-    // Listen for "callEnded" event to finish this activity (remote side hang-up)
+    // Listen for "callEnded" / "callRinging" events
     private val callEndedListener = object : EventListener {
         override fun onEventTriggered(event: Event) {
-            if (event.eventName == "callEnded") {
-                log.d("Received callEnded event — finishing VideoCallActivity")
-                finish()
+            when (event.eventName) {
+                "callEnded" -> {
+                    log.d("Received callEnded event — finishing VideoCallActivity")
+                    finish()
+                }
             }
         }
     }
@@ -214,6 +221,7 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
 
     var callingTarget by remember { mutableStateOf<String?>(null) }
     var isInCall by remember { mutableStateOf(false) }
+    var outgoingCallState by remember { mutableStateOf(OutgoingCallState.CONNECTING) }
 
     // Hold renderers
     var localRendererRef by remember { mutableStateOf<SurfaceViewRenderer?>(null) }
@@ -222,6 +230,71 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
     // WebRTC and signaling
     var signalingClient by remember { mutableStateOf<HASignalingClient?>(null) }
     var webRtcClient by remember { mutableStateOf<WebRTCClient?>(null) }
+
+    // Listen for callRinging event via EventNotifier (ForegroundService fires this
+    // when vaca_call_ringing arrives from the target device).
+    DisposableEffect(Unit) {
+        val listener = object : EventListener {
+            override fun onEventTriggered(event: Event) {
+                if (event.eventName == "callRinging") {
+                    outgoingCallState = OutgoingCallState.RINGING
+                }
+            }
+        }
+        config.eventBroadcaster.addListener(listener)
+        onDispose { config.eventBroadcaster.removeListener(listener) }
+    }
+
+    // ---- Audio feedback for outgoing calls --------------------------------
+    // CONNECTING: short beep every 3 seconds
+    // RINGING: standard ringback tone (1s on, 3s off)
+    // Stops when the call transitions to IN_CALL or the composable leaves.
+    if (!initialTarget.isNullOrEmpty() && !isInCall) {
+        DisposableEffect(outgoingCallState) {
+            val toneType = when (outgoingCallState) {
+                OutgoingCallState.CONNECTING -> ToneGenerator.TONE_PROP_PROMPT
+                OutgoingCallState.RINGING    -> ToneGenerator.TONE_SUP_RINGTONE
+                else -> -1
+            }
+            var toneGen: ToneGenerator? = null
+            var job: kotlinx.coroutines.Job? = null
+
+            if (toneType >= 0) {
+                try {
+                    toneGen = ToneGenerator(AudioManager.STREAM_VOICE_CALL, 80)
+                } catch (_: Exception) {}
+
+                job = scope.launch {
+                    try {
+                        when (outgoingCallState) {
+                            OutgoingCallState.CONNECTING -> {
+                                while (true) {
+                                    toneGen?.startTone(ToneGenerator.TONE_PROP_PROMPT, 200)
+                                    delay(3000)
+                                }
+                            }
+                            OutgoingCallState.RINGING -> {
+                                while (true) {
+                                    toneGen?.startTone(ToneGenerator.TONE_SUP_RINGTONE, 1000)
+                                    delay(4000) // 1s tone + 3s silence
+                                }
+                            }
+                            else -> {}
+                        }
+                    } finally {
+                        try { toneGen?.stopTone() } catch (_: Exception) {}
+                        try { toneGen?.release() } catch (_: Exception) {}
+                    }
+                }
+            }
+
+            onDispose {
+                job?.cancel()
+                try { toneGen?.stopTone() } catch (_: Exception) {}
+                try { toneGen?.release() } catch (_: Exception) {}
+            }
+        }
+    }
 
     // HA signaling listener (answers/ice only — offers go through ForegroundService)
     val haListener = remember {
@@ -235,6 +308,9 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
                     val target = data.getString("target_device")
                     if (target != config.uuid) return
                     val sdp = data.getString("sdp")
+                    // Answer received = media will start → transition to IN_CALL
+                    outgoingCallState = OutgoingCallState.IN_CALL
+                    isInCall = true
                     scope.launch { webRtcClient?.setRemoteDescription("answer", sdp) }
                 } catch (e: Exception) { Logger().e("Answer handling error: $e") }
             }
@@ -283,7 +359,8 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
                 remoteRendererRef?.let { webrtc.setRemoteRenderer(it) }
                 localRendererRef?.let { webrtc.startLocalVideo(it) }
                 webrtc.createOffer()
-                isInCall = true
+                // Don't set isInCall yet — stay in CONNECTING state until
+                // the target confirms ringing (→ RINGING) or answers (→ IN_CALL).
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // Coroutine cancelled (activity finishing) — createWebRtcClient
                 // already disposed the client.  Re-throw so structured concurrency works.
@@ -414,8 +491,51 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
             )
         }
 
+        // ---- Call-state overlay (connecting / ringing) --------------------
+        if (!initialTarget.isNullOrEmpty() && !isInCall) {
+            // Animated dots "..." that cycle every second
+            var dotCount by remember { mutableStateOf(1) }
+            LaunchedEffect(Unit) {
+                while (true) {
+                    delay(600)
+                    dotCount = (dotCount % 3) + 1
+                }
+            }
+            val dots = ".".repeat(dotCount)
+            val statusText = when (outgoingCallState) {
+                OutgoingCallState.CONNECTING -> "Connecting$dots"
+                OutgoingCallState.RINGING    -> "Ringing$dots"
+                OutgoingCallState.IN_CALL    -> ""
+            }
+            val statusColor = when (outgoingCallState) {
+                OutgoingCallState.CONNECTING -> Color(0xFFFFA726) // orange
+                OutgoingCallState.RINGING    -> Color(0xFF66BB6A) // green
+                OutgoingCallState.IN_CALL    -> Color.White
+            }
+
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 32.dp)
+                    .background(
+                        Color.Black.copy(alpha = 0.6f),
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                    .padding(horizontal = 24.dp, vertical = 12.dp)
+            ) {
+                Text(
+                    text = statusText,
+                    color = statusColor,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+
         // End call button — red circle, bottom center
-        if (isInCall) {
+        // Visible always for outgoing calls (connecting/ringing/in-call)
+        // and once connected for incoming calls.
+        if (isInCall || !initialTarget.isNullOrEmpty()) {
             Box(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
