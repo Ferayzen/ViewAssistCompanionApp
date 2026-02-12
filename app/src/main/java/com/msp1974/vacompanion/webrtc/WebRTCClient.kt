@@ -17,7 +17,7 @@ interface WebRTCListener {
 
 class WebRTCClient(private val ctx: Context, private val listener: WebRTCListener) {
     private val log = Logger()
-    private val maxCapturePixels = 1280 * 720
+    private val maxCapturePixels = 1920 * 1080
 
     // EGL context for local/remote video rendering.
     // Created during init() to keep renderer and capturer setup consistent.
@@ -246,7 +246,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
     private data class CaptureSetting(val width: Int, val height: Int, val fps: Int)
 
     /**
-     * Select the best supported camera format up to 720p (highest resolution, then highest fps).
+     * Select the best supported camera format up to 1080p (highest resolution, then highest fps).
      * Falls back to conservative defaults if capabilities cannot be queried.
      */
     private fun buildCaptureCandidates(): List<CaptureSetting> {
@@ -255,6 +255,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
 
         if (enumerator == null || deviceName.isNullOrBlank()) {
             return listOf(
+                CaptureSetting(1920, 1080, 30),
                 CaptureSetting(1280, 720, 30),
                 CaptureSetting(960, 540, 30),
                 CaptureSetting(640, 480, 30),
@@ -281,6 +282,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
 
             if (supported.isEmpty()) {
                 listOf(
+                    CaptureSetting(1920, 1080, 30),
                     CaptureSetting(1280, 720, 30),
                     CaptureSetting(960, 540, 30),
                     CaptureSetting(640, 480, 30),
@@ -292,6 +294,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
         } catch (e: Exception) {
             log.e("Failed to query supported camera formats for $deviceName: $e")
             listOf(
+                CaptureSetting(1920, 1080, 30),
                 CaptureSetting(1280, 720, 30),
                 CaptureSetting(960, 540, 30),
                 CaptureSetting(640, 480, 30),
