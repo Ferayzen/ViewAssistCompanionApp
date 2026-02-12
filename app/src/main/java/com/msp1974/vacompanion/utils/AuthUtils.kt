@@ -313,6 +313,29 @@ class AuthUtils(val config: APPConfig) {
             }
         }
 
+        /**
+         * Ensures config.accessToken is valid.  If the token has expired and a
+         * refresh token is available, performs a synchronous refresh and updates
+         * config.  Returns the (possibly refreshed) access token.
+         *
+         * Must be called from a background / IO thread (performs a network call).
+         */
+        @Synchronized
+        fun ensureFreshToken(config: APPConfig): String {
+            if (config.refreshToken.isNotEmpty() && System.currentTimeMillis() > config.tokenExpiry) {
+                val auth = refreshAccessToken(
+                    getHAUrl(config, withDashboardPath = false),
+                    config.refreshToken,
+                    !config.ignoreSSLErrors
+                )
+                if (auth.accessToken.isNotEmpty() && auth.expires > System.currentTimeMillis()) {
+                    config.accessToken = auth.accessToken   // setter fires "accessToken" event
+                    config.tokenExpiry = auth.expires
+                }
+            }
+            return config.accessToken
+        }
+
         // Perform a GET request to Home Assistant API using stored access token
         fun haGet(url: String, config: APPConfig, verifySSL: Boolean = true): String {
             val client = buildHttpClient(verifySSL)
@@ -337,14 +360,17 @@ class AuthUtils(val config: APPConfig) {
         }
 
         // Post an event to Home Assistant (eg. /api/events/<event_type>)
-        fun haPostEvent(baseUrl: String, eventType: String, jsonBody: String, token: String, verifySSL: Boolean = true): Boolean {
+        fun haPostEvent(baseUrl: String, eventType: String, jsonBody: String, token: String, verifySSL: Boolean = true, config: APPConfig? = null): Boolean {
+            // If a config is provided, ensure the token is fresh before posting.
+            // When called without config (legacy), the raw token is used as-is.
+            val effectiveToken = if (config != null) ensureFreshToken(config) else token
             val client = buildHttpClient(verifySSL)
             val mediaType = "application/json; charset=utf-8".toMediaType()
             val body = jsonBody.toRequestBody(mediaType)
             val url = baseUrl.removeSuffix("/") + "/api/events/" + eventType
             val request = Request.Builder()
                 .url(url)
-                .addHeader("Authorization", "Bearer " + token)
+                .addHeader("Authorization", "Bearer " + effectiveToken)
                 .post(body)
                 .build()
 

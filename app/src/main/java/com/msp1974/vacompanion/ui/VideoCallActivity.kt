@@ -1,6 +1,8 @@
 package com.msp1974.vacompanion.ui
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Bundle
@@ -35,6 +37,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import org.webrtc.SurfaceViewRenderer
 import com.msp1974.vacompanion.settings.APPConfig
@@ -42,8 +45,6 @@ import com.msp1974.vacompanion.utils.AuthUtils
 import com.msp1974.vacompanion.utils.Event
 import com.msp1974.vacompanion.utils.EventListener
 import com.msp1974.vacompanion.utils.Logger
-import com.msp1974.vacompanion.webrtc.HASignalingClient
-import com.msp1974.vacompanion.webrtc.HASignalingListener
 import com.msp1974.vacompanion.webrtc.WebRTCClient
 import com.msp1974.vacompanion.webrtc.WebRTCListener
 import kotlinx.coroutines.Dispatchers
@@ -55,7 +56,7 @@ import org.webrtc.IceCandidate
 import org.json.JSONObject
 
 /** Tracks the outgoing-call lifecycle visible to the caller. */
-private enum class OutgoingCallState { CONNECTING, RINGING, IN_CALL }
+private enum class OutgoingCallState { CONNECTING, RINGING, IN_CALL, NO_ANSWER, BUSY }
 
 class VideoCallActivity : ComponentActivity() {
     private val log = Logger()
@@ -77,6 +78,19 @@ class VideoCallActivity : ComponentActivity() {
 
         val config = APPConfig.getInstance(this)
         config.eventBroadcaster.addListener(callEndedListener)
+
+        // Check permissions before proceeding
+        val hasMic = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val hasCam = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        if (!hasMic) {
+            Toast.makeText(this, "Microphone permission required for calls", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
+        if (!hasCam) {
+            // Camera is optional — proceed with audio-only but warn
+            Toast.makeText(this, "Camera permission not granted — audio only", Toast.LENGTH_LONG).show()
+        }
 
         // Keep the screen active while a call is ongoing
         try {
@@ -133,7 +147,8 @@ class VideoCallActivity : ComponentActivity() {
                     "vaca_call_ended",
                     json.toString(),
                     config.accessToken,
-                    !config.ignoreSSLErrors
+                    !config.ignoreSSLErrors,
+                    config
                 )
             } catch (_: Exception) {}
         }
@@ -157,19 +172,47 @@ class VideoCallActivity : ComponentActivity() {
 }
 
 // ---------------------------------------------------------------------------
-//  Helper: create a WebRTCClient, initialise, create peer connection
+//  Helper: create a WebRTCClient, initialise, create peer connection.
+//  Uses the service's signaling client via event bus (no direct reference).
 // ---------------------------------------------------------------------------
 private suspend fun createWebRtcClient(
     ctx: android.content.Context,
     config: APPConfig,
-    peerId: String,
-    signaling: HASignalingClient?
+    peerId: String
 ): WebRTCClient = withContext(Dispatchers.Default) {
     val client = WebRTCClient(ctx.applicationContext, object : WebRTCListener {
         override fun onLocalSdp(type: String, sdp: String) {
+            // Send via REST (same as before) — the service's signaling client
+            // picks up the answer/ICE via WebSocket and routes to us via events.
             when {
-                type.equals("offer", true)  -> signaling?.sendOffer(config.uuid, peerId, sdp)
-                type.equals("answer", true) -> signaling?.sendAnswer(config.uuid, peerId, sdp)
+                type.equals("offer", true) -> {
+                    AuthUtils.haPostEvent(
+                        AuthUtils.getHAUrl(config, false),
+                        "vaca_webrtc_offer",
+                        JSONObject().apply {
+                            put("caller_uuid", config.uuid)
+                            put("target_device", peerId)
+                            put("sdp", sdp)
+                        }.toString(),
+                        config.accessToken,
+                        !config.ignoreSSLErrors,
+                        config
+                    )
+                }
+                type.equals("answer", true) -> {
+                    AuthUtils.haPostEvent(
+                        AuthUtils.getHAUrl(config, false),
+                        "vaca_webrtc_answer",
+                        JSONObject().apply {
+                            put("caller_uuid", config.uuid)
+                            put("target_device", peerId)
+                            put("sdp", sdp)
+                        }.toString(),
+                        config.accessToken,
+                        !config.ignoreSSLErrors,
+                        config
+                    )
+                }
             }
         }
 
@@ -179,7 +222,18 @@ private suspend fun createWebRtcClient(
                 put("sdpMLineIndex", candidate.sdpMLineIndex)
                 put("candidate", candidate.sdp)
             }
-            signaling?.sendIce(config.uuid, peerId, obj)
+            AuthUtils.haPostEvent(
+                AuthUtils.getHAUrl(config, false),
+                "vaca_webrtc_ice",
+                JSONObject().apply {
+                    put("caller_uuid", config.uuid)
+                    put("target_device", peerId)
+                    put("candidate", obj)
+                }.toString(),
+                config.accessToken,
+                !config.ignoreSSLErrors,
+                config
+            )
         }
 
         override fun onRemoteStreamAvailable() {}
@@ -227,17 +281,41 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
     var localRendererRef by remember { mutableStateOf<SurfaceViewRenderer?>(null) }
     var remoteRendererRef by remember { mutableStateOf<SurfaceViewRenderer?>(null) }
 
-    // WebRTC and signaling
-    var signalingClient by remember { mutableStateOf<HASignalingClient?>(null) }
+    // WebRTC only — no per-activity signaling client (uses service's via events)
     var webRtcClient by remember { mutableStateOf<WebRTCClient?>(null) }
 
-    // Listen for callRinging event via EventNotifier (ForegroundService fires this
-    // when vaca_call_ringing arrives from the target device).
+    // Listen for callRinging / callBusy / webrtcAnswer / webrtcIce events
+    // routed by ForegroundService from the single signaling WebSocket.
     DisposableEffect(Unit) {
         val listener = object : EventListener {
             override fun onEventTriggered(event: Event) {
-                if (event.eventName == "callRinging") {
-                    outgoingCallState = OutgoingCallState.RINGING
+                when (event.eventName) {
+                    "callRinging" -> {
+                        outgoingCallState = OutgoingCallState.RINGING
+                    }
+                    "callBusy" -> {
+                        outgoingCallState = OutgoingCallState.BUSY
+                    }
+                    "webrtcAnswer" -> {
+                        try {
+                            val data = JSONObject(event.newValue as String)
+                            val sdp = data.getString("sdp")
+                            outgoingCallState = OutgoingCallState.IN_CALL
+                            isInCall = true
+                            scope.launch { webRtcClient?.setRemoteDescription("answer", sdp) }
+                        } catch (e: Exception) { Logger().e("Answer handling error: $e") }
+                    }
+                    "webrtcIce" -> {
+                        try {
+                            val data = JSONObject(event.newValue as String)
+                            val cand = data.getJSONObject("candidate")
+                            val sdp = cand.getString("candidate")
+                            val sdpMid = cand.optString("sdpMid", null)
+                            val sdpMLineIndex = cand.optInt("sdpMLineIndex", 0)
+                            val ice = IceCandidate(sdpMid, sdpMLineIndex, sdp)
+                            scope.launch { webRtcClient?.addRemoteIce(ice) }
+                        } catch (e: Exception) { Logger().e("ICE handling error: $e") }
+                    }
                 }
             }
         }
@@ -296,53 +374,32 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
         }
     }
 
-    // HA signaling listener (answers/ice only — offers go through ForegroundService)
-    val haListener = remember {
-        object : HASignalingListener {
-            override fun onOfferReceived(data: JSONObject) {
-                // Offers handled by ForegroundService → dashboard overlay
-            }
-
-            override fun onAnswerReceived(data: JSONObject) {
-                try {
-                    val target = data.getString("target_device")
-                    if (target != config.uuid) return
-                    val sdp = data.getString("sdp")
-                    // Answer received = media will start → transition to IN_CALL
-                    outgoingCallState = OutgoingCallState.IN_CALL
-                    isInCall = true
-                    scope.launch { webRtcClient?.setRemoteDescription("answer", sdp) }
-                } catch (e: Exception) { Logger().e("Answer handling error: $e") }
-            }
-
-            override fun onIceReceived(data: JSONObject) {
-                try {
-                    val target = data.getString("target_device")
-                    if (target != config.uuid) return
-                    val cand = data.getJSONObject("candidate")
-                    val sdp = cand.getString("candidate")
-                    val sdpMid = cand.optString("sdpMid", null)
-                    val sdpMLineIndex = cand.optInt("sdpMLineIndex", 0)
-                    val ice = IceCandidate(sdpMid, sdpMLineIndex, sdp)
-                    scope.launch { webRtcClient?.addRemoteIce(ice) }
-                } catch (e: Exception) { Logger().e("ICE handling error: $e") }
-            }
-
-            override fun onCallEndedReceived(data: JSONObject) {
-                // Handled by ForegroundService → callEnded event → callEndedListener → finish().
-                // WebRTC disposal is handled by composable lifecycle (DisposableEffect).
+    // ---- 30-second caller timeout -----------------------------------------
+    // If the target hasn't answered within 30s, give up and show "No answer".
+    if (!initialTarget.isNullOrEmpty() && !isInCall) {
+        LaunchedEffect(Unit) {
+            delay(30_000)
+            if (!isInCall && outgoingCallState != OutgoingCallState.IN_CALL) {
+                outgoingCallState = OutgoingCallState.NO_ANSWER
+                // Wait briefly so user can see the message, then end
+                delay(2000)
+                onBack(initialTarget)
             }
         }
     }
 
+    // ---- Auto-end on busy ---------------------------------------------------
+    if (outgoingCallState == OutgoingCallState.BUSY) {
+        LaunchedEffect(Unit) {
+            delay(2000) // show "Busy" briefly
+            onBack(callingTarget)
+        }
+    }
+
     // -----------------------------------------------------------------------
-    //  Main setup
+    //  Main setup — no per-activity signaling client; uses service's via events
     // -----------------------------------------------------------------------
     LaunchedEffect(Unit) {
-        val sig = HASignalingClient(config, haListener)
-        signalingClient = sig
-        sig.connect()
-
         // --- Outgoing call (initial target from vaca_start_call) -----------
         if (!initialTarget.isNullOrEmpty()) {
             callingTarget = initialTarget
@@ -354,7 +411,7 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
             delay(600)  // give BackgroundTask time to release the mic
 
             try {
-                val webrtc = createWebRtcClient(ctx, config, initialTarget, sig)
+                val webrtc = createWebRtcClient(ctx, config, initialTarget)
                 webRtcClient = webrtc
                 remoteRendererRef?.let { webrtc.setRemoteRenderer(it) }
                 localRendererRef?.let { webrtc.startLocalVideo(it) }
@@ -387,7 +444,7 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
                     config.eventBroadcaster.notifyEvent(Event("pauseAudioInput", "", true))
                     delay(600)  // give BackgroundTask time to release the mic
 
-                    val webrtc = createWebRtcClient(ctx, config, caller, sig)
+                    val webrtc = createWebRtcClient(ctx, config, caller)
                     webRtcClient = webrtc
                     remoteRendererRef?.let { webrtc.setRemoteRenderer(it) }
                     localRendererRef?.let { webrtc.startLocalVideo(it) }
@@ -421,16 +478,14 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
         client.setRemoteRenderer(renderer)
     }
 
-    // Cleanup: release renderers, dispose WebRTC, close signaling when composable is destroyed
+    // Cleanup: release renderers, dispose WebRTC when composable is destroyed
     DisposableEffect(Unit) {
         onDispose {
             // Capture references — composable state is torn down after onDispose
             val rtc = webRtcClient
-            val sig = signalingClient
             val localR = localRendererRef
             val remoteR = remoteRendererRef
             webRtcClient = null
-            signalingClient = null
 
             // Release renderers on the main thread (they're Views, must be on UI thread)
             rtc?.releaseRenderers(localR, remoteR)
@@ -441,9 +496,6 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
             Thread {
                 try {
                     rtc?.dispose()
-                } catch (_: Exception) {}
-                try {
-                    sig?.close()
                 } catch (_: Exception) {}
             }.start()
         }
@@ -505,11 +557,15 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
             val statusText = when (outgoingCallState) {
                 OutgoingCallState.CONNECTING -> "Connecting$dots"
                 OutgoingCallState.RINGING    -> "Ringing$dots"
+                OutgoingCallState.NO_ANSWER  -> "No answer"
+                OutgoingCallState.BUSY       -> "Busy"
                 OutgoingCallState.IN_CALL    -> ""
             }
             val statusColor = when (outgoingCallState) {
                 OutgoingCallState.CONNECTING -> Color(0xFFFFA726) // orange
                 OutgoingCallState.RINGING    -> Color(0xFF66BB6A) // green
+                OutgoingCallState.NO_ANSWER  -> Color(0xFFE53935) // red
+                OutgoingCallState.BUSY       -> Color(0xFFE53935) // red
                 OutgoingCallState.IN_CALL    -> Color.White
             }
 

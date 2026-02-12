@@ -3,9 +3,7 @@ package com.msp1974.vacompanion.webrtc
 import com.msp1974.vacompanion.settings.APPConfig
 import com.msp1974.vacompanion.utils.AuthUtils
 import com.msp1974.vacompanion.utils.Logger
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import okhttp3.*
 import okio.ByteString
 import org.json.JSONObject
@@ -24,6 +22,8 @@ interface HASignalingListener {
     fun onCallDeclinedReceived(data: JSONObject) { }
     // Optional: called when the remote side confirms it is ringing
     fun onCallRingingReceived(data: JSONObject) { }
+    // Optional: called when the remote side reports it is busy
+    fun onCallBusyReceived(data: JSONObject) { }
 }
 
 class HASignalingClient(private val config: APPConfig, private val listener: HASignalingListener) {
@@ -37,10 +37,20 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
         .build()
     private val idCounter = AtomicInteger(1)
 
+    // HA-level heartbeat — sends {"type":"ping"} and expects {"type":"pong"}.
+    // Detects zombie WebSocket connections that OkHttp-level pings miss.
+    private val heartbeatScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var heartbeatJob: Job? = null
+    @Volatile private var pendingPingId: Int = -1
+
     // Optional status callback to notify about connection/auth state changes
     var statusCallback: ((Boolean) -> Unit)? = null
     // Optional log callback so callers can display logs in UI
     var logCallback: ((String) -> Unit)? = null
+
+    /** Whether the WebSocket is currently authenticated and subscribed. */
+    @Volatile var isConnected: Boolean = false
+        private set
 
     fun connect() {
         CoroutineScope(Dispatchers.IO).launch {
@@ -61,7 +71,18 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
                     override fun onMessage(webSocket: WebSocket, text: String) {
                         try {
                             val json = JSONObject(text)
-                            if (json.has("type") && json.getString("type") == "auth_required") {
+                            val msgType = json.optString("type", "")
+
+                            // HA heartbeat pong response
+                            if (msgType == "pong") {
+                                val id = json.optInt("id", -1)
+                                if (id == pendingPingId) {
+                                    pendingPingId = -1  // pong received, clear pending
+                                }
+                                return
+                            }
+
+                            if (msgType == "auth_required") {
                                 // Send auth
                                 val auth = JSONObject().apply {
                                     put("type", "auth")
@@ -74,7 +95,7 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
                                 return
                             }
 
-                            if (json.has("type") && json.getString("type") == "auth_ok") {
+                            if (msgType == "auth_ok") {
                                 log.d("HA WS auth_ok received")
                                 try { logCallback?.invoke("auth_ok received") } catch (e: Exception) {}
                                 // Subscribe to our event types
@@ -85,19 +106,24 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
                                 subscribeEvent(webSocket, "vaca_call_ended")
                                 subscribeEvent(webSocket, "vaca_call_declined")
                                 subscribeEvent(webSocket, "vaca_call_ringing")
+                                subscribeEvent(webSocket, "vaca_call_busy")
                                 try { logCallback?.invoke("Subscribed to vaca_* events") } catch (e: Exception) {}
                                 // Notify that we are connected and authenticated
+                                isConnected = true
                                 try { statusCallback?.invoke(true) } catch (e: Exception) {}
+                                // Start HA-level heartbeat
+                                startHeartbeat(webSocket)
                                 return
                             }
-                            if (json.has("type") && json.getString("type") == "auth_invalid") {
+                            if (msgType == "auth_invalid") {
                                 log.e("HA WS auth invalid")
                                 try { logCallback?.invoke("auth_invalid received") } catch (e: Exception) {}
+                                isConnected = false
                                 try { statusCallback?.invoke(false) } catch (e: Exception) {}
                                 return
                             }
 
-                            if (json.has("type") && json.getString("type") == "event") {
+                            if (msgType == "event") {
                                 val event = json.getJSONObject("event")
                                 val eventType = event.getString("event_type")
                                 val data = event.getJSONObject("data")
@@ -121,6 +147,9 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
                                     "vaca_call_ringing" -> {
                                         try { listener.onCallRingingReceived(data) } catch (e: Exception) {}
                                     }
+                                    "vaca_call_busy" -> {
+                                        try { listener.onCallBusyReceived(data) } catch (e: Exception) {}
+                                    }
                                     else -> {
                                         try { logCallback?.invoke("Unhandled event type: $eventType") } catch (e: Exception) {}
                                     }
@@ -136,20 +165,72 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
                     override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                         log.d("HA WS closing: $code $reason")
                         try { logCallback?.invoke("WS closing: $code $reason") } catch (e: Exception) {}
+                        isConnected = false
+                        stopHeartbeat()
                         try { statusCallback?.invoke(false) } catch (e: Exception) {}
                     }
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                         log.e("HA WS failure: $t")
                         try { logCallback?.invoke("WS failure: ${t.message}") } catch (e: Exception) {}
+                        isConnected = false
+                        stopHeartbeat()
                         try { statusCallback?.invoke(false) } catch (e: Exception) {}
                     }
                 })
             } catch (e: Exception) {
                 log.e("Error connecting to HA websocket: $e")
+                isConnected = false
                 try { statusCallback?.invoke(false) } catch (e: Exception) {}
             }
         }
+    }
+
+    // ---- HA-level heartbeat -------------------------------------------------
+    // Sends {"id": N, "type": "ping"} every 25 seconds and expects
+    // {"id": N, "type": "pong"} within 10 seconds.  If no pong arrives,
+    // the connection is considered dead and we force-close + notify status.
+    private fun startHeartbeat(webSocket: WebSocket) {
+        stopHeartbeat()
+        heartbeatJob = heartbeatScope.launch {
+            try {
+                while (isActive) {
+                    delay(25_000)
+                    val id = idCounter.getAndIncrement()
+                    pendingPingId = id
+                    val msg = JSONObject().apply {
+                        put("id", id)
+                        put("type", "ping")
+                    }
+                    try {
+                        webSocket.send(msg.toString())
+                    } catch (e: Exception) {
+                        log.e("HA heartbeat send failed: $e")
+                        break
+                    }
+                    delay(10_000)
+                    if (pendingPingId == id) {
+                        // No pong received — connection is dead
+                        log.e("HA heartbeat timeout — no pong received, forcing reconnect")
+                        try { logCallback?.invoke("Heartbeat timeout — forcing reconnect") } catch (_: Exception) {}
+                        isConnected = false
+                        try { webSocket.cancel() } catch (_: Exception) {}
+                        try { statusCallback?.invoke(false) } catch (_: Exception) {}
+                        break
+                    }
+                }
+            } catch (_: CancellationException) {
+                // Normal shutdown
+            } catch (e: Exception) {
+                log.e("Heartbeat error: $e")
+            }
+        }
+    }
+
+    private fun stopHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+        pendingPingId = -1
     }
 
     private fun subscribeEvent(ws: WebSocket, eventType: String) {
@@ -165,6 +246,9 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
     }
 
     fun close() {
+        stopHeartbeat()
+        heartbeatScope.cancel()
+        isConnected = false
         ws?.close(1000, "closing")
     }
 
@@ -175,7 +259,7 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
             put("target_device", targetDevice)
             put("sdp", sdp)
         }
-        AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_webrtc_offer", json.toString(), config.accessToken, !config.ignoreSSLErrors)
+        AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_webrtc_offer", json.toString(), config.accessToken, !config.ignoreSSLErrors, config)
     }
 
     fun sendAnswer(callerUuid: String, targetDevice: String, sdp: String) {
@@ -184,7 +268,7 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
             put("target_device", targetDevice)
             put("sdp", sdp)
         }
-        AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_webrtc_answer", json.toString(), config.accessToken, !config.ignoreSSLErrors)
+        AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_webrtc_answer", json.toString(), config.accessToken, !config.ignoreSSLErrors, config)
     }
 
     fun sendIce(callerUuid: String, targetDevice: String, candidate: JSONObject) {
@@ -193,7 +277,7 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
             put("target_device", targetDevice)
             put("candidate", candidate)
         }
-        AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_webrtc_ice", json.toString(), config.accessToken, !config.ignoreSSLErrors)
+        AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_webrtc_ice", json.toString(), config.accessToken, !config.ignoreSSLErrors, config)
     }
 
     fun sendCallEnded(callerUuid: String, targetDevice: String) {
@@ -201,7 +285,7 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
             put("caller_uuid", callerUuid)
             put("target_device", targetDevice)
         }
-        AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_call_ended", json.toString(), config.accessToken, !config.ignoreSSLErrors)
+        AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_call_ended", json.toString(), config.accessToken, !config.ignoreSSLErrors, config)
     }
 
     fun sendCallRinging(callerUuid: String, targetDevice: String) {
@@ -209,6 +293,14 @@ class HASignalingClient(private val config: APPConfig, private val listener: HAS
             put("caller_uuid", callerUuid)
             put("target_device", targetDevice)
         }
-        AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_call_ringing", json.toString(), config.accessToken, !config.ignoreSSLErrors)
+        AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_call_ringing", json.toString(), config.accessToken, !config.ignoreSSLErrors, config)
+    }
+
+    fun sendCallBusy(callerUuid: String, targetDevice: String) {
+        val json = JSONObject().apply {
+            put("caller_uuid", callerUuid)
+            put("target_device", targetDevice)
+        }
+        AuthUtils.haPostEvent(AuthUtils.getHAUrl(config, false), "vaca_call_busy", json.toString(), config.accessToken, !config.ignoreSSLErrors, config)
     }
 }

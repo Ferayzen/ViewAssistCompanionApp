@@ -71,7 +71,8 @@ private fun fireDeclineEvent(caller: String, config: APPConfig, scope: Coroutine
                 "vaca_call_declined",
                 json.toString(),
                 config.accessToken,
-                !config.ignoreSSLErrors
+                !config.ignoreSSLErrors,
+                config
             )
         } catch (_: Exception) {}
     }
@@ -90,7 +91,8 @@ private fun fireRingingEvent(caller: String, config: APPConfig, scope: Coroutine
                 "vaca_call_ringing",
                 json.toString(),
                 config.accessToken,
-                !config.ignoreSSLErrors
+                !config.ignoreSSLErrors,
+                config
             )
         } catch (_: Exception) {}
     }

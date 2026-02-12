@@ -45,7 +45,7 @@ class CallActionReceiver : BroadcastReceiver() {
                     val json = JSONObject()
                     json.put("caller_uuid", caller)
                     json.put("target_device", cfg.uuid)
-                    AuthUtils.haPostEvent(AuthUtils.getHAUrl(cfg, false), "vaca_call_declined", json.toString(), cfg.accessToken, !cfg.ignoreSSLErrors)
+                    AuthUtils.haPostEvent(AuthUtils.getHAUrl(cfg, false), "vaca_call_declined", json.toString(), cfg.accessToken, !cfg.ignoreSSLErrors, cfg)
                 }
             }
         } catch (e: Exception) {

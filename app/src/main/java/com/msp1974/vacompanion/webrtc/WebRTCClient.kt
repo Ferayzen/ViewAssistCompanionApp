@@ -78,9 +78,12 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
      * [startLocalVideo] once a SurfaceViewRenderer is available.
      */
     fun createPeerConnection() {
-        val iceServers = listOf(
-            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()
-        )
+        // Local-network only: no STUN/TURN servers needed.
+        // WebRTC still gathers host candidates from local interfaces which is
+        // sufficient when both devices are on the same LAN as HA.
+        // Omitting STUN avoids a multi-second timeout when there is no
+        // internet access.
+        val iceServers = emptyList<PeerConnection.IceServer>()
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers)
         rtcConfig.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
 

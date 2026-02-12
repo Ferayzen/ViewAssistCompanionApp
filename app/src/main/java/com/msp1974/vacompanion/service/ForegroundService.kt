@@ -32,6 +32,9 @@ import com.msp1974.vacompanion.utils.Logger
 import com.msp1974.vacompanion.webrtc.HASignalingClient
 import com.msp1974.vacompanion.webrtc.HASignalingListener
 import com.msp1974.vacompanion.utils.AuthUtils
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 import timber.log.Timber
 import java.util.Timer
@@ -70,7 +73,9 @@ class VAForegroundService : Service() {
                 "accessToken" -> {
                     val token = event.newValue as? String ?: ""
                     if (token.isNotBlank()) {
-                        // Token set; ensure signaling client is started
+                        // Token changed — tear down existing client and reconnect
+                        // with the new token so auth stays valid.
+                        stopSignalingClient()
                         startSignalingClient()
                     } else {
                         stopSignalingClient()
@@ -254,6 +259,13 @@ class VAForegroundService : Service() {
     }
 
     private fun startSignalingClient() {
+        // Cancel any pending retry first to avoid races where both the retry
+        // and a manual start fire concurrently.
+        if (signalingRetryHandler != null && signalingRetryRunnable != null) {
+            signalingRetryHandler?.removeCallbacks(signalingRetryRunnable!!)
+            signalingRetryHandler = null
+            signalingRetryRunnable = null
+        }
         if (signalingClient != null) return
         if (config.accessToken.isBlank()) {
             Timber.d("Signaling client not started: missing access token")
@@ -291,7 +303,17 @@ class VAForegroundService : Service() {
                     }
 
                     if (target != config.uuid) return
-                    if (isVideoCallActivityActive()) return
+
+                    // If already in a call, send busy signal back
+                    if (isVideoCallActivityActive()) {
+                        Timber.d("Already in a call, sending busy to $caller")
+                        CoroutineScope(Dispatchers.IO).launch {
+                            try {
+                                signalingClient?.sendCallBusy(config.uuid, caller)
+                            } catch (_: Exception) {}
+                        }
+                        return
+                    }
 
                     if (DEBUG_OVERLAY) showDebugToast("Incoming call offer from $caller")
 
@@ -313,6 +335,10 @@ class VAForegroundService : Service() {
                     if (DEBUG_OVERLAY) {
                         try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "answer from $caller to $target")) } catch (e: Exception) {}
                     }
+                    // Route to VideoCallActivity via event bus
+                    if (target == config.uuid) {
+                        config.eventBroadcaster.notifyEvent(Event("webrtcAnswer", "", data.toString()))
+                    }
                 } catch (e: Exception) {}
             }
 
@@ -322,6 +348,10 @@ class VAForegroundService : Service() {
                     val target = data.getString("target_device")
                     if (DEBUG_OVERLAY) {
                         try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "ice from $caller to $target")) } catch (e: Exception) {}
+                    }
+                    // Route to VideoCallActivity via event bus
+                    if (target == config.uuid) {
+                        config.eventBroadcaster.notifyEvent(Event("webrtcIce", "", data.toString()))
                     }
                 } catch (e: Exception) {}
             }
@@ -396,6 +426,22 @@ class VAForegroundService : Service() {
                     Logger().e("Foreground signaling call-ringing error: $e")
                 }
             }
+
+            override fun onCallBusyReceived(data: JSONObject) {
+                try {
+                    val caller = data.optString("caller_uuid", "")
+                    val target = data.optString("target_device", "")
+                    if (DEBUG_OVERLAY) {
+                        try { config.eventBroadcaster.notifyEvent(Event("signalingLog", "", "call_busy from $target for $caller")) } catch (e: Exception) {}
+                    }
+                    // If this device is the caller, notify that the target is busy
+                    if (caller == config.uuid) {
+                        config.eventBroadcaster.notifyEvent(Event("callBusy", "", target))
+                    }
+                } catch (e: Exception) {
+                    Logger().e("Foreground signaling call-busy error: $e")
+                }
+            }
         })
 
         signalingClient?.statusCallback = { connected ->
@@ -468,11 +514,24 @@ class VAForegroundService : Service() {
         signalingHealthTimer = Timer()
         signalingHealthTimer?.schedule(object : TimerTask() {
             override fun run() {
-                if (!signalingConnected && signalingClient == null
+                // Case 1: No client and no retry pending — orphaned state
+                if (signalingClient == null
                     && signalingRetryHandler == null
                     && config.accessToken.isNotBlank()) {
-                    Timber.w("Signaling health check: not connected, no retry pending — forcing reconnect")
+                    Timber.w("Signaling health check: no client, no retry pending — forcing reconnect")
                     Handler(Looper.getMainLooper()).post {
+                        startSignalingClient()
+                    }
+                    return
+                }
+                // Case 2: Client exists but reports disconnected (zombie) — tear down and reconnect
+                val client = signalingClient
+                if (client != null && !client.isConnected
+                    && signalingRetryHandler == null
+                    && config.accessToken.isNotBlank()) {
+                    Timber.w("Signaling health check: zombie connection detected — forcing reconnect")
+                    Handler(Looper.getMainLooper()).post {
+                        stopSignalingClient()
                         startSignalingClient()
                     }
                 }
