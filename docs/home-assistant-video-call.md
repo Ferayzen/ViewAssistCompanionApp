@@ -7,7 +7,7 @@ This document explains how to trigger video calls from Home Assistant without an
 - The VACA app runs a background websocket client while the foreground service is active.
 - Home Assistant sends a `vaca_start_call` event with caller and target device IDs.
 - The caller device opens the Video Call screen and starts the call.
-- The callee device receives the offer event and shows an incoming-call notification with Accept/Decline actions.
+- The callee device receives the offer event and shows an in-app incoming-call overlay with Accept/Decline actions.
 
 ## Required Device IDs
 
@@ -53,7 +53,7 @@ Replace `script.start_vaca_video_call` with the script entity ID created in step
 1) Home Assistant fires `vaca_start_call` with `caller_uuid` and `target_device`.
 2) The caller device opens the Video Call screen and starts the call.
 3) The caller posts `vaca_webrtc_offer` to HA.
-4) The callee receives the offer and shows an incoming call notification.
+4) The callee receives the offer and shows an incoming call overlay.
 5) Accept launches the Video Call screen and answers the call.
 
 ## Call End / Decline Flow

@@ -52,11 +52,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.webrtc.IceCandidate
 import org.json.JSONObject
+import kotlin.coroutines.resume
+import kotlinx.coroutines.suspendCancellableCoroutine
 
 /** Tracks the outgoing-call lifecycle visible to the caller. */
 private enum class OutgoingCallState { CONNECTING, RINGING, IN_CALL, NO_ANSWER, BUSY }
+private const val MAX_SDP_CHARS = 100_000
 
 class VideoCallActivity : ComponentActivity() {
     private val log = Logger()
@@ -159,16 +163,52 @@ class VideoCallActivity : ComponentActivity() {
     private fun extractTargetFromIntent(intent: Intent?): String? {
         if (intent == null) return null
         val byExtra = intent.getStringExtra("target_device")
-        if (!byExtra.isNullOrEmpty()) return byExtra
+        if (!byExtra.isNullOrEmpty()) {
+            return if (isValidDeviceId(byExtra)) byExtra else null
+        }
         val data = intent.data
         if (data != null) {
             val targetQuery = data.getQueryParameter("target")
-            if (!targetQuery.isNullOrEmpty()) return targetQuery
+            if (!targetQuery.isNullOrEmpty()) {
+                return if (isValidDeviceId(targetQuery)) targetQuery else null
+            }
             val segments = data.pathSegments
-            if (segments.isNotEmpty()) return segments.last()
+            if (segments.isNotEmpty()) {
+                val candidate = segments.last()
+                return if (isValidDeviceId(candidate)) candidate else null
+            }
         }
         return null
     }
+
+    private fun isValidDeviceId(value: String): Boolean {
+        // UUIDs are expected; keep validation permissive enough for legacy IDs.
+        return value.length in 8..64 && value.matches(Regex("^[a-zA-Z0-9_-]+$"))
+    }
+}
+
+private suspend fun pauseBackgroundAudioForCall(config: APPConfig, timeoutMs: Long = 4000): Boolean {
+    return withTimeoutOrNull(timeoutMs) {
+        suspendCancellableCoroutine { continuation ->
+            var resolved = false
+            val listener = object : EventListener {
+                override fun onEventTriggered(event: Event) {
+                    if (event.eventName != "audioInputPaused" || resolved) return
+                    resolved = true
+                    config.eventBroadcaster.removeListener(this)
+                    continuation.resume(true)
+                }
+            }
+
+            continuation.invokeOnCancellation {
+                config.eventBroadcaster.removeListener(listener)
+            }
+
+            config.eventBroadcaster.addListener(listener)
+            config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", false))
+            config.eventBroadcaster.notifyEvent(Event("pauseAudioInput", "", true))
+        }
+    } ?: false
 }
 
 // ---------------------------------------------------------------------------
@@ -406,9 +446,11 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
 
             // Pause background audio BEFORE creating WebRTC so the mic is free
             // (needed on Android < 10 which lacks concurrent audio capture)
-            config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", false))
-            config.eventBroadcaster.notifyEvent(Event("pauseAudioInput", "", true))
-            delay(600)  // give BackgroundTask time to release the mic
+            val paused = pauseBackgroundAudioForCall(config)
+            if (!paused) {
+                Logger().e("Timed out waiting for assistant mic release, proceeding with fallback delay")
+                delay(600)
+            }
 
             try {
                 val webrtc = createWebRtcClient(ctx, config, initialTarget)
@@ -437,12 +479,14 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
         if (auto) {
             val caller = act?.intent?.getStringExtra("incoming_caller")
             val sdp = act?.intent?.getStringExtra("offer_sdp")
-            if (!caller.isNullOrEmpty() && !sdp.isNullOrEmpty()) {
+            if (!caller.isNullOrEmpty() && !sdp.isNullOrEmpty() && sdp.length <= MAX_SDP_CHARS) {
                 try {
                     // Pause background audio BEFORE creating WebRTC
-                    config.eventBroadcaster.notifyEvent(Event("enableMotionDetection", "", false))
-                    config.eventBroadcaster.notifyEvent(Event("pauseAudioInput", "", true))
-                    delay(600)  // give BackgroundTask time to release the mic
+                    val paused = pauseBackgroundAudioForCall(config)
+                    if (!paused) {
+                        Logger().e("Timed out waiting for assistant mic release, proceeding with fallback delay")
+                        delay(600)
+                    }
 
                     val webrtc = createWebRtcClient(ctx, config, caller)
                     webRtcClient = webrtc
@@ -461,6 +505,8 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
                     config.eventBroadcaster.notifyEvent(Event("resumeAudioInput", "", true))
                 }
                 act.intent.removeExtra("auto_accept")
+            } else if (auto) {
+                Logger().e("Rejecting invalid incoming call intent payload")
             }
         }
     }

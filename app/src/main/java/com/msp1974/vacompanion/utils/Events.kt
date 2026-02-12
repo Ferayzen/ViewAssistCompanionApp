@@ -1,5 +1,7 @@
 package com.msp1974.vacompanion.utils
 
+import java.util.concurrent.CopyOnWriteArraySet
+
 data class Event(val eventName: String, val oldValue: Any, val newValue: Any)
 
 interface EventListener {
@@ -8,7 +10,7 @@ interface EventListener {
 
 class EventNotifier {
 
-    private val listeners: MutableSet<EventListener> = HashSet()
+    private val listeners: MutableSet<EventListener> = CopyOnWriteArraySet()
 
     fun addListener(eventListener: EventListener) {
         listeners.add(eventListener)

@@ -58,6 +58,11 @@ class VAForegroundService : Service() {
     private var signalingRetryRunnable: Runnable? = null
     private var signalingHealthTimer: Timer? = null
     @Volatile private var signalingConnected = false
+    @Volatile private var signalingManuallyStopped = false
+
+    private fun shouldRunSignaling(): Boolean {
+        return config.pairedDeviceID.isNotBlank() && config.accessToken.isNotBlank()
+    }
 
     private val signalingEventListener = object : EventListener {
         override fun onEventTriggered(event: Event) {
@@ -65,20 +70,22 @@ class VAForegroundService : Service() {
                 "pairedDeviceID" -> {
                     val paired = event.newValue as? String ?: ""
                     if (paired.isNotBlank()) {
+                        signalingManuallyStopped = false
                         startSignalingClient()
                     } else {
-                        stopSignalingClient()
+                        stopSignalingClient(manualStop = true)
                     }
                 }
                 "accessToken" -> {
                     val token = event.newValue as? String ?: ""
                     if (token.isNotBlank()) {
+                        signalingManuallyStopped = false
                         // Token changed — tear down existing client and reconnect
                         // with the new token so auth stays valid.
-                        stopSignalingClient()
+                        stopSignalingClient(manualStop = false)
                         startSignalingClient()
                     } else {
-                        stopSignalingClient()
+                        stopSignalingClient(manualStop = true)
                     }
                 }
             }
@@ -239,7 +246,7 @@ class VAForegroundService : Service() {
     override fun onDestroy() {
         Timber.i("Stopping Background Service")
         watchdogTimer.cancel()
-        stopSignalingClient()
+        stopSignalingClient(manualStop = true)
         config.eventBroadcaster.removeListener(signalingEventListener)
         backgroundTask?.shutdown()
         config.backgroundTaskRunning = false
@@ -259,6 +266,11 @@ class VAForegroundService : Service() {
     }
 
     private fun startSignalingClient() {
+        if (signalingManuallyStopped) {
+            Timber.d("Signaling client start skipped: manually stopped")
+            return
+        }
+
         // Cancel any pending retry first to avoid races where both the retry
         // and a manual start fire concurrently.
         if (signalingRetryHandler != null && signalingRetryRunnable != null) {
@@ -267,8 +279,8 @@ class VAForegroundService : Service() {
             signalingRetryRunnable = null
         }
         if (signalingClient != null) return
-        if (config.accessToken.isBlank()) {
-            Timber.d("Signaling client not started: missing access token")
+        if (!shouldRunSignaling()) {
+            Timber.d("Signaling client not started: pairing or token missing")
             if (DEBUG_OVERLAY) showDebugToast("Signaling: missing access token — retrying")
             return
         }
@@ -467,7 +479,10 @@ class VAForegroundService : Service() {
         startSignalingHealthCheck()
     }
 
-    private fun stopSignalingClient() {
+    private fun stopSignalingClient(manualStop: Boolean = false) {
+        if (manualStop) {
+            signalingManuallyStopped = true
+        }
         // cancel health check
         signalingHealthTimer?.cancel()
         signalingHealthTimer = null
@@ -488,6 +503,11 @@ class VAForegroundService : Service() {
      * Cleans up the current client first so startSignalingClient() can create a new one.
      */
     private fun scheduleSignalingReconnect(delayMs: Long = 10_000) {
+        if (signalingManuallyStopped || !shouldRunSignaling()) {
+            Timber.d("Skipping signaling reconnect: manual stop or missing prerequisites")
+            return
+        }
+
         // Avoid duplicate scheduled reconnects
         if (signalingRetryHandler != null && signalingRetryRunnable != null) return
 
@@ -517,7 +537,8 @@ class VAForegroundService : Service() {
                 // Case 1: No client and no retry pending — orphaned state
                 if (signalingClient == null
                     && signalingRetryHandler == null
-                    && config.accessToken.isNotBlank()) {
+                    && !signalingManuallyStopped
+                    && shouldRunSignaling()) {
                     Timber.w("Signaling health check: no client, no retry pending — forcing reconnect")
                     Handler(Looper.getMainLooper()).post {
                         startSignalingClient()
@@ -528,10 +549,11 @@ class VAForegroundService : Service() {
                 val client = signalingClient
                 if (client != null && !client.isConnected
                     && signalingRetryHandler == null
-                    && config.accessToken.isNotBlank()) {
+                    && !signalingManuallyStopped
+                    && shouldRunSignaling()) {
                     Timber.w("Signaling health check: zombie connection detected — forcing reconnect")
                     Handler(Looper.getMainLooper()).post {
-                        stopSignalingClient()
+                        stopSignalingClient(manualStop = false)
                         startSignalingClient()
                     }
                 }

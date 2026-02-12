@@ -18,7 +18,8 @@ interface WebRTCListener {
 class WebRTCClient(private val ctx: Context, private val listener: WebRTCListener) {
     private val log = Logger()
 
-    // EGL context — only created when video is enabled (API >= 28)
+    // EGL context for local/remote video rendering.
+    // Created during init() to keep renderer and capturer setup consistent.
     private var eglBase: EglBase? = null
     private var peerConnectionFactory: PeerConnectionFactory? = null
     private var peerConnection: PeerConnection? = null

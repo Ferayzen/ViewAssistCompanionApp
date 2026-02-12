@@ -33,6 +33,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
@@ -51,6 +52,7 @@ internal class BackgroundTaskController (private val context: Context): EventLis
     private val scope = CoroutineScope(Dispatchers.Default + job)
     private var audioInJob: Job? = null
     private var audioResumeJob: Job? = null
+    private var audioPauseJob: Job? = null
     private var wakeWordJob: Job? = null
     private var wakeWordEngine: WakeWordEngine? = null
     private var holdDetectionLevelJob: Job? = null
@@ -248,7 +250,13 @@ internal class BackgroundTaskController (private val context: Context): EventLis
                 audioResumeJob?.cancel()
                 audioResumeJob = null
                 stopOpenWakeWordDetection()
-                stopInputAudio()
+                audioPauseJob?.cancel()
+                audioPauseJob = scope.launch {
+                    stopInputAudioAndWait()
+                    // Signal completion so callers can safely create WebRTC AudioRecord
+                    // only after the assistant mic has actually been released.
+                    config.eventBroadcaster.notifyEvent(Event("audioInputPaused", "", true))
+                }
             }
             "resumeAudioInput" -> {
                 // Restore the microphone after a WebRTC call ends.
@@ -359,16 +367,22 @@ internal class BackgroundTaskController (private val context: Context): EventLis
         }
         Timber.i("Stopping input audio")
         job.cancel()
-        // Wait for the AudioRecorder's finally block (stop + release) to complete
-        // so the native microphone handle is actually freed before we return.
-        // Uses Thread.sleep loop instead of runBlocking to avoid deadlocking the
-        // main thread (EventNotifier delivers events synchronously on the caller's
-        // thread, which may be the main thread).
-        val deadline = System.currentTimeMillis() + 3000
-        while (job.isActive && System.currentTimeMillis() < deadline) {
-            try { Thread.sleep(50) } catch (_: InterruptedException) { break }
+        audioInJob = null
+    }
+
+    private suspend fun stopInputAudioAndWait(timeoutMs: Long = 3000) {
+        val job = audioInJob ?: return
+        if (!job.isActive) {
+            audioInJob = null
+            return
         }
-        if (job.isActive) {
+        Timber.i("Stopping input audio")
+        job.cancel()
+        val completed = withTimeoutOrNull(timeoutMs) {
+            job.join()
+            true
+        } ?: false
+        if (!completed) {
             Timber.w("Timed out waiting for audio input to stop")
         }
         audioInJob = null
