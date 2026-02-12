@@ -350,7 +350,11 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
                             val data = JSONObject(event.newValue as String)
                             val cand = data.getJSONObject("candidate")
                             val sdp = cand.getString("candidate")
-                            val sdpMid = cand.optString("sdpMid", null)
+                            val sdpMid = if (cand.has("sdpMid") && !cand.isNull("sdpMid")) {
+                                cand.getString("sdpMid")
+                            } else {
+                                ""
+                            }
                             val sdpMLineIndex = cand.optInt("sdpMLineIndex", 0)
                             val ice = IceCandidate(sdpMid, sdpMLineIndex, sdp)
                             scope.launch { webRtcClient?.addRemoteIce(ice) }
@@ -477,8 +481,8 @@ fun VideoCallScreen(onBack: (String?) -> Unit, initialTarget: String? = null) {
         val act = ctx as? ComponentActivity
         val auto = act?.intent?.getBooleanExtra("auto_accept", false) ?: false
         if (auto) {
-            val caller = act?.intent?.getStringExtra("incoming_caller")
-            val sdp = act?.intent?.getStringExtra("offer_sdp")
+            val caller = act.intent.getStringExtra("incoming_caller")
+            val sdp = act.intent.getStringExtra("offer_sdp")
             if (!caller.isNullOrEmpty() && !sdp.isNullOrEmpty() && sdp.length <= MAX_SDP_CHARS) {
                 try {
                     // Pause background audio BEFORE creating WebRTC

@@ -17,6 +17,7 @@ interface WebRTCListener {
 
 class WebRTCClient(private val ctx: Context, private val listener: WebRTCListener) {
     private val log = Logger()
+    private val maxCapturePixels = 1280 * 720
 
     // EGL context for local/remote video rendering.
     // Created during init() to keep renderer and capturer setup consistent.
@@ -40,6 +41,8 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
     private var remoteRendererInitialized = false
     @Volatile private var disposed = false
     private var audioHealthThread: Thread? = null
+    private var selectedCameraDeviceName: String? = null
+    private var activeCameraEnumerator: CameraEnumerator? = null
 
     /** Expose the shared EGL context so renderers can be pre-initialised. */
     fun getEglContext(): EglBase.Context? = eglBase?.eglBaseContext
@@ -53,7 +56,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
         PeerConnectionFactory.initialize(initOptions)
 
         eglBase = EglBase.create()
-        log.d("WebRTC init — EGL + HW codecs")
+        log.d("WebRTC init — EGL + HW-preferred codecs")
 
         // Create an explicit AudioDeviceModule so we have full control over its
         // lifecycle.  Without this the factory creates a default one internally
@@ -61,8 +64,21 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
         audioDeviceModule = JavaAudioDeviceModule.builder(ctx)
             .createAudioDeviceModule()
 
-        val encoderFactory = DefaultVideoEncoderFactory(eglBase!!.eglBaseContext, true, true)
-        val decoderFactory = DefaultVideoDecoderFactory(eglBase!!.eglBaseContext)
+        val encoderFactory: VideoEncoderFactory = try {
+            log.d("WebRTC video encoder factory: HardwareVideoEncoderFactory")
+            HardwareVideoEncoderFactory(eglBase!!.eglBaseContext, true, true)
+        } catch (e: Exception) {
+            log.e("HardwareVideoEncoderFactory unavailable, falling back to DefaultVideoEncoderFactory: $e")
+            DefaultVideoEncoderFactory(eglBase!!.eglBaseContext, true, true)
+        }
+
+        val decoderFactory: VideoDecoderFactory = try {
+            log.d("WebRTC video decoder factory: HardwareVideoDecoderFactory")
+            HardwareVideoDecoderFactory(eglBase!!.eglBaseContext)
+        } catch (e: Exception) {
+            log.e("HardwareVideoDecoderFactory unavailable, falling back to DefaultVideoDecoderFactory: $e")
+            DefaultVideoDecoderFactory(eglBase!!.eglBaseContext)
+        }
 
         peerConnectionFactory = PeerConnectionFactory.builder()
             .setOptions(PeerConnectionFactory.Options())
@@ -196,6 +212,8 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
             Camera1Enumerator(true)
         }
 
+        activeCameraEnumerator = enumerator
+
         val deviceNames = try { enumerator.deviceNames } catch (e: Exception) {
             log.e("Failed to enumerate camera devices: $e")
             arrayOf<String>()
@@ -213,6 +231,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
             }
         }
         if (chosenDevice == null && deviceNames.isNotEmpty()) chosenDevice = deviceNames[0]
+        selectedCameraDeviceName = chosenDevice
         log.d("Camera device chosen: $chosenDevice (using ${if (useCamera2) "Camera2" else "Camera1"})")
         return if (chosenDevice != null) {
             try {
@@ -222,6 +241,63 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
                 null
             }
         } else null
+    }
+
+    private data class CaptureSetting(val width: Int, val height: Int, val fps: Int)
+
+    /**
+     * Select the best supported camera format up to 720p (highest resolution, then highest fps).
+     * Falls back to conservative defaults if capabilities cannot be queried.
+     */
+    private fun buildCaptureCandidates(): List<CaptureSetting> {
+        val enumerator = activeCameraEnumerator
+        val deviceName = selectedCameraDeviceName
+
+        if (enumerator == null || deviceName.isNullOrBlank()) {
+            return listOf(
+                CaptureSetting(1280, 720, 30),
+                CaptureSetting(960, 540, 30),
+                CaptureSetting(640, 480, 30),
+                CaptureSetting(320, 240, 15)
+            )
+        }
+
+        return try {
+            val supported = enumerator.getSupportedFormats(deviceName)
+                .map { format ->
+                    val maxFps = (format.framerate.max + 999) / 1000
+                    CaptureSetting(
+                        width = format.width,
+                        height = format.height,
+                        fps = maxFps.coerceAtLeast(15)
+                    )
+                }
+                .filter { (it.width * it.height) <= maxCapturePixels }
+                .distinctBy { Triple(it.width, it.height, it.fps) }
+                .sortedWith(
+                    compareByDescending<CaptureSetting> { it.width * it.height }
+                        .thenByDescending { it.fps }
+                )
+
+            if (supported.isEmpty()) {
+                listOf(
+                    CaptureSetting(1280, 720, 30),
+                    CaptureSetting(960, 540, 30),
+                    CaptureSetting(640, 480, 30),
+                    CaptureSetting(320, 240, 15)
+                )
+            } else {
+                supported
+            }
+        } catch (e: Exception) {
+            log.e("Failed to query supported camera formats for $deviceName: $e")
+            listOf(
+                CaptureSetting(1280, 720, 30),
+                CaptureSetting(960, 540, 30),
+                CaptureSetting(640, 480, 30),
+                CaptureSetting(320, 240, 15)
+            )
+        }
     }
 
     /**
@@ -235,7 +311,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
             try {
                 localRenderer.init(eglBase!!.eglBaseContext, null)
                 localRenderer.setMirror(true)
-                try { localRenderer.setEnableHardwareScaler(false) } catch (_: Exception) {}
+                try { localRenderer.setEnableHardwareScaler(true) } catch (_: Exception) {}
                 try { localRenderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT) } catch (_: Exception) {}
                 localRendererAttached = true
                 log.d("Local renderer initialised")
@@ -254,22 +330,24 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
             }
         }
 
-        // Start camera capture if not already started. Try a couple of fallbacks for older devices.
+        // Start camera capture if not already started. Prefer the best supported format.
         if (!localCapturing) {
-            try {
-                videoCapturer?.startCapture(640, 480, 30)
-                localCapturing = true
-                log.d("Camera capture started (640x480@30)")
-            } catch (e: Exception) {
-                log.e("Error starting camera capture at 640x480: $e — trying 320x240@15")
+            val candidates = buildCaptureCandidates()
+            var lastError: Exception? = null
+            for (candidate in candidates) {
                 try {
-                    videoCapturer?.startCapture(320, 240, 15)
+                    videoCapturer?.startCapture(candidate.width, candidate.height, candidate.fps)
                     localCapturing = true
-                    log.d("Camera capture started (320x240@15)")
-                } catch (e2: Exception) {
-                    log.e("Error starting camera capture at 320x240: $e2")
-                    // Notify user-friendly message via Logger only (UI layer can react to logs)
+                    log.d("Camera capture started (${candidate.width}x${candidate.height}@${candidate.fps})")
+                    break
+                } catch (e: Exception) {
+                    lastError = e
+                    log.e("Error starting camera capture at ${candidate.width}x${candidate.height}@${candidate.fps}: $e")
                 }
+            }
+
+            if (!localCapturing) {
+                log.e("Unable to start camera capture with any supported format. Last error: $lastError")
             }
         }
     }
@@ -296,7 +374,7 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
         if (!remoteRendererInitialized) {
             try {
                 remoteRenderer?.init(eglBase!!.eglBaseContext, null)
-                try { remoteRenderer?.setEnableHardwareScaler(false) } catch (_: Exception) {}
+                try { remoteRenderer?.setEnableHardwareScaler(true) } catch (_: Exception) {}
                 try { remoteRenderer?.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT) } catch (_: Exception) {}
                 try { remoteRenderer?.setMirror(false) } catch (_: Exception) {}
                 remoteRendererInitialized = true
@@ -516,6 +594,8 @@ class WebRTCClient(private val ctx: Context, private val listener: WebRTCListene
             try { surfaceTextureHelper?.dispose() } catch (_: Exception) {}
             videoCapturer = null
             surfaceTextureHelper = null
+            selectedCameraDeviceName = null
+            activeCameraEnumerator = null
 
             // 6. Release the explicit audio device module (releases native AudioRecord/AudioTrack)
             try { audioDeviceModule?.release() } catch (_: Exception) {}
